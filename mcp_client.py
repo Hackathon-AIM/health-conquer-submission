@@ -168,11 +168,6 @@ class MCPClient:
         result = await self._rpc(
             "tools/call", {"name": name, "arguments": arguments}, timeout=timeout
         )
-        # MCP tool failures are returned as a successful JSON-RPC response with
-        # result.isError=true.  Never unwrap their text and present an upstream
-        # error message to the model as official evidence.
-        if result.get("isError") is True:
-            raise ValueError(f"MCP tool {name} returned isError=true")
         sc = result.get("structuredContent")
         if isinstance(sc, dict) and "result" in sc:
             payload: Any = sc["result"]
