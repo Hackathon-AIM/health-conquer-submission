@@ -1,0 +1,13 @@
+# 현장용. 오프닝에서 받은 값으로 base_url 을 채운다.
+name: live
+retrieval:
+  mode: live
+llm:
+  base_url: ""          # TODO(현장): https://.../v1
+  context_window: 8192  # TODO(현장): 실제 값 확인. 8K면 아래 예산 유지
+retrieval:
+  mode: live
+  context_token_budget: 2400
+  # 실제 엔드포인트는 소스당 20건씩 뽑으므로 리랭킹이 값어치를 한다.
+  # 첫 실행 시 모델 로딩에 수십 초 걸린다(1회). 느리면 none 으로 되돌릴 것.
+  reranker: bge

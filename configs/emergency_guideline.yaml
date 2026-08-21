@@ -1,0 +1,6 @@
+name: emergency_guideline
+retrieval:
+  mode: mock
+emergency:
+  sources: ["guideline"]
+  top_k: 1

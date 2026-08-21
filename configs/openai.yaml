@@ -1,0 +1,38 @@
+# 파이프라인 검증 전용 설정 — 대회 설정이 아닙니다.
+#
+# 목적: FM이 없는 지금, 파이프라인이 '실제 LLM'과 물려서 도는지 확인한다.
+#   · 분류기가 QueryPlan JSON을 제대로 뱉는가
+#   · 비평 루프가 수렴하는가, 무한루프를 도는가
+#   · 재작성이 자기모순을 실제로 고치는가
+#   · serve.py 가 CoEval 호출 형식에 맞는가
+# 이 로직들은 FM으로 바뀌어도 안 변하므로, 여기서 잡은 버그는 현장에서 안 만난다.
+#
+# ⚠️ 8/21 현장에서는 configs/live.yaml 을 쓸 것. drafter 는 반드시 의과학 FM.
+#
+# API 키는 환경변수로만 넣는다. 이 파일에 절대 쓰지 말 것.
+#   cp .env.example .env && vi .env      # OPENAI_API_KEY=sk-...
+#   또는  export OPENAI_API_KEY=sk-...
+
+name: openai_validation
+
+llm:
+  base_url: "https://api.openai.com/v1"
+  api_key_env: OPENAI_API_KEY        # ← 환경변수 이름만 지정. 값은 여기 안 씀
+  timeout: 30.0
+  max_retries: 1
+  temperature: 0.2
+  max_tokens: 1200
+  context_window: 128000             # 검증용 모델 기준. FM 은 8K 일 수 있음
+
+models:
+  classifier: gpt-4o-mini
+  rewriter:   gpt-4o-mini
+  drafter:    gpt-4o-mini            # ⚠️ 대회에서는 반드시 의과학 FM
+  critic:     gpt-4o-mini
+  extractor:  gpt-4o-mini
+  grader:     gpt-4.1                # CoEval healthbench_judge 기본값과 동일
+
+retrieval:
+  mode: mock                          # 실제 RAG 엔드포인트가 없으므로 mock
+  context_token_budget: 2400
+  reranker: none

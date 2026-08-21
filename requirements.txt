@@ -1,0 +1,19 @@
+# 코어 (필수)
+openai>=1.40           # FM OpenAI-호환 엔드포인트
+httpx>=0.27            # RAG 엔드포인트 비동기 호출
+pydantic>=2.7          # 계층 간 계약
+pyyaml>=6.0            # 설정
+pytest>=8.0            # 결정론적 계층 테스트
+
+# 선택 — 없어도 파이프라인은 돈다
+langgraph>=0.2         # graph.py 래퍼용. pipeline.py 만으로도 완전 동작
+FlagEmbedding>=1.2     # BGE 리랭커. 없으면 검색 점수 기준 정렬로 폴백
+pandas>=2.0            # data/build_dicts.py 에서 CSV 사전 생성
+rapidfuzz>=3.0         # 약물명 퍼지 매칭 (선택)
+
+# ❌ 넣지 않은 것과 이유
+#   neo4j      — GraphRAG는 인덱싱 비용이 벡터 RAG의 10~40배. 20시간에 비현실적.
+#                게다가 대회가 RAG '엔드포인트'를 제공하므로 우리가 그래프를 만들
+#                원본 코퍼스를 통째로 받을 수 있을지도 불확실하다.
+#   pgvector   — 검색 엔드포인트가 제공되면 우리가 벡터DB를 만들 이유가 없다.
+#                로컬에 필요한 건 약물 사전인데 그건 dict/JSON이면 충분하다.
