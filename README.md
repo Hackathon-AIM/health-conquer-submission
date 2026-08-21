@@ -246,3 +246,15 @@ HealthBench에서 근거가 확실한 것은 배치 점수뿐이다 (맨 앞 +10
 `configs/*.yaml`의 `models.drafter`는 반드시 의과학 FM이어야 한다(심사 대상 텍스트).
 나머지 4자리(classifier/rewriter/critic/extractor)에 다른 모델을 써도 되는지는
 공고에 명시가 없으므로 **오프닝에서 반드시 질문할 것.** 기본값은 전 구간 FM(리스크 0).
+
+## HealthBench형 E2E 점검
+
+제출 컨테이너를 먼저 실행한 뒤, 합성 영어·한국어 멀티턴·응급 대화와 MCP 문서 왕복을 검사합니다. HealthBench 원문·rubric은 사용하거나 저장하지 않습니다.
+
+```bash
+docker build -t health-conquer:e2e .
+docker run --rm -p 8000:8000 health-conquer:e2e
+python3 scripts/healthbench_e2e.py
+```
+
+MCP를 제외한 서비스 점검만 하려면 `--skip-mcp`를 붙입니다. 실제 MCP 점검에는 `LUNIT_FM_API_KEY` 환경변수가 필요합니다.
