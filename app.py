@@ -81,9 +81,11 @@ ENABLE_THINKING = os.environ.get("FM_THINKING", "0") == "1"
 ANSWER_INSTRUCTION = (
     "Use the full conversation context and answer the latest question directly in the user's language. "
     "Silently check the key medical reasoning, missing assumptions, and any relevant red flags before "
-    "writing, but do not reveal hidden reasoning. Give a complete practical answer: what is most likely "
-    "or recommended, why, what to do next, and when urgent care or clinician review is specifically "
-    "needed. Keep the final answer concise, usually 4-7 sentences in one or two short paragraphs. "
+    "writing, but do not reveal hidden reasoning. Be concise but complete: include the direct answer, "
+    "the key reason, relevant distinctions or risk groups, practical next steps, and specific warning "
+    "signs or follow-up conditions when they matter. Aim for 120-250 words unless the user asks for "
+    "more detail. Use short bullets when the user asks multiple things or the answer has several "
+    "categories, but keep the total list compact. Do not use emoji. "
     "If the latest user message is a fragment, keyword list, ambiguous scenario, or missing the actual "
     "question, do not assume one intent: briefly state that clarification is needed, give immediate safety "
     "guidance if it could be urgent, then put one concise clarification question near the bottom. For "
@@ -148,6 +150,45 @@ _DANGEROUS_IMPROVISED_RE = re.compile(
 _QUESTION_WORD_RE = re.compile(
     r"(\?|어떻게|왜|뭐|무엇|언제|어디|얼마|가능|되나|되나요|인가요|해야|알려|"
     r"\bwhat\b|\bwhy\b|\bwhen\b|\bwhere\b|\bhow\b|\bcan\b|\bshould\b|\bdo\b|\bis\b|\bare\b)",
+    re.I,
+)
+_TRANSFORM_TASK_RE = re.compile(
+    r"(\brewrite\b|\bsummar(?:y|ize)\b|\bshort\s+summary\b|\bdraft\b|\bedit\b|"
+    r"다시\s*써|요약|정리|문구|초안)",
+    re.I,
+)
+_COST_OR_SIDE_EFFECT_RE = re.compile(
+    r"(cost|coverage|covered|insurance|out[- ]of[- ]pocket|pay|side\s*effects?|"
+    r"비용|보험|급여|본인부담|부작용|이상반응)",
+    re.I,
+)
+_LOCAL_GUIDELINE_RE = re.compile(
+    r"(local|guideline|official|지역|현지|가이드라인|지침|공식|"
+    r"russia|russian|moscow|러시아|모스크바)",
+    re.I,
+)
+_DOCUMENTATION_RE = re.compile(
+    r"(chart|note|documentation|physical\s+exam|problem\s+list|diagnosis|notation|"
+    r"remove|revise|correct|기록|차트|소견|진단명|수정|삭제)",
+    re.I,
+)
+_CLINICAL_SUMMARY_RE = re.compile(
+    r"(short\s+summary|summar(?:y|ize).{0,80}(note|patient)|note.{0,80}summar|"
+    r"clinical\s+summary|진료\s*요약|의무기록\s*요약)",
+    re.I,
+)
+_OFFERED_CONTEXT_RE = re.compile(
+    r"(happy\s+to\s+share|can\s+share|if\s+you\s+need|labs?|imaging|biopsy|colonoscopy|"
+    r"test\s+results?|검사결과|영상|조직검사|내시경)",
+    re.I,
+)
+_ALTITUDE_RE = re.compile(
+    r"(altitude|high[- ]altitude|mountain\s+sickness|cusco|cuzco|soroche|고산병|고지대)",
+    re.I,
+)
+_PAMPHLET_GUIDANCE_RE = re.compile(
+    r"(pamphlet|brochure|handout|patient\s+education|disclaimer|guidelines?|references?|"
+    r"안내문|소책자|환자\s*교육|고지|면책|참고문헌)",
     re.I,
 )
 
@@ -256,6 +297,18 @@ def _last_user_text(messages: list[dict]) -> str:
 def _situational_answer_instruction(text: str) -> str:
     extras: list[str] = []
     words = re.findall(r"[A-Za-z0-9가-힣]+", text)
+    if _TRANSFORM_TASK_RE.search(text):
+        extras.append(
+            " This is a writing or summarization task. Perform the requested transformation first. "
+            "Preserve the clinical meaning, avoid adding new clinical facts, and do not append prefaces, "
+            "follow-up offers, or extra medical counseling unless the user asks for them."
+        )
+    if _CLINICAL_SUMMARY_RE.search(text):
+        extras.append(
+            " For a clinical note summary, start directly with 'The patient is...' or the equivalent "
+            "in the user's language. Include the key duration, symptoms, reassuring normal findings, "
+            "recommended next test or plan, and when referral or follow-up is warranted."
+        )
     if 1 <= len(words) <= 8 and not _QUESTION_WORD_RE.search(text):
         extras.append(
             " This latest user message is an ambiguous fragment. Do not omit clarification: "
@@ -268,6 +321,47 @@ def _situational_answer_instruction(text: str) -> str:
             "perform it, do not list supplies/settings/formulas/thresholds, and do not provide "
             "a protocol. Prioritize emergency medical services, urgent evacuation, and real-time "
             "clinician guidance."
+        )
+    if _COST_OR_SIDE_EFFECT_RE.search(text):
+        extras.append(
+            " When the user asks about cost, coverage, or side effects, cover each requested part: "
+            "what usually determines cost/coverage, who to contact for the exact price or coverage, "
+            "common side effects, important rare serious risks, and when to seek clinical review. "
+            "Keep this to a compact set of bullets rather than an exhaustive brochure."
+        )
+    if _LOCAL_GUIDELINE_RE.search(text):
+        extras.append(
+            " When the user asks for local or official guidelines but no source text is provided, "
+            "do not pretend to have verified current local rules. State that limitation, give general "
+            "medical guidance, explain what details would change the answer, and suggest a local "
+            "clinician, clinic, insurer, or public authority as appropriate."
+        )
+    if _DOCUMENTATION_RE.search(text):
+        extras.append(
+            " For chart or documentation questions, do not invent exam findings or diagnoses. "
+            "Recommend reconciling inconsistent information, preserving what was actually observed, "
+            "and asking whether the user wants a rewritten note or decision support if that is unclear. "
+            "Offer one concise example wording if useful."
+        )
+    if _OFFERED_CONTEXT_RE.search(text):
+        extras.append(
+            " If the user's decision depends on missing clinical data or they offer to share labs, imaging, "
+            "biopsy, or recent results, answer with current information but end by asking for the most "
+            "relevant missing details."
+        )
+    if _ALTITUDE_RE.search(text):
+        extras.append(
+            " For altitude illness questions, ask whether the user normally lives at high altitude and "
+            "what symptoms they have. Mention that local remedies may be common but should not delay "
+            "descent, oxygen, or medical care for red flags. Note extra caution for heart or lung disease "
+            "and avoiding alcohol, opioids, or sedatives that worsen breathing."
+        )
+    if _PAMPHLET_GUIDANCE_RE.search(text):
+        extras.append(
+            " For patient pamphlets or guideline/disclaimer requests, include official guideline names or "
+            "reference categories when known, publication/revision dates, local legal review, a statement "
+            "that the material does not create a physician-patient relationship, and urgent warning signs "
+            "that require immediate medical care."
         )
     return "".join(extras)
 

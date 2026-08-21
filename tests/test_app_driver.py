@@ -110,6 +110,40 @@ class AppDriverTests(unittest.TestCase):
         self.assertIn("final sentence must be one direct question", content)
         self.assertIn("do not provide a protocol", content)
 
+    def test_answer_instruction_adds_task_aware_guards(self) -> None:
+        transform = driver_app._situational_answer_instruction(
+            "rewrite this clinical note into a short summary"
+        )
+        cost = driver_app._situational_answer_instruction(
+            "iud insertion cost out of pocket side effects"
+        )
+        local = driver_app._situational_answer_instruction(
+            "moscow local russian guidelines for TSH postpartum"
+        )
+        documentation = driver_app._situational_answer_instruction(
+            "advanced COPD in chart but normal physical exam should I remove it"
+        )
+        altitude = driver_app._situational_answer_instruction(
+            "altitude sickness in cusco local remedy"
+        )
+        pamphlet = driver_app._situational_answer_instruction(
+            "pregnancy pamphlet official guidelines and disclaimers"
+        )
+        crohn = driver_app._situational_answer_instruction(
+            "Crohn disease happy to share labs imaging biopsy results"
+        )
+
+        self.assertIn("writing or summarization task", transform)
+        self.assertIn("avoid adding new clinical facts", transform)
+        self.assertIn("The patient is", transform)
+        self.assertIn("common side effects", cost)
+        self.assertIn("rare serious risks", cost)
+        self.assertIn("do not pretend to have verified current local rules", local)
+        self.assertIn("do not invent exam findings", documentation)
+        self.assertIn("normally lives at high altitude", altitude)
+        self.assertIn("physician-patient relationship", pamphlet)
+        self.assertIn("most relevant missing details", crohn)
+
     def test_chat_completion_never_returns_empty_content(self) -> None:
         async def fake_generate_reply(
             _messages: list[dict[str, Any]],
