@@ -131,7 +131,15 @@ async def generate(
         "retrieval: status=%s items=%d calls=%d q=%r",
         result.status, len(result.items), result.tool_calls_used, query[:80],
     )
-    log.info("retrieval trace: %s", " | ".join(result.trace)[:400])
+    _ev = result.as_prompt()
+    log.info(
+        "retrieval trace: %s",
+        " | ".join(result.trace)[:400],
+    )
+    log.info(
+        "evidence: 원본 %d자 -> 프롬프트 %d자 (항목 %d)",
+        sum(len(e.text) for e in result.items), len(_ev), len(result.items),
+    )
 
     # 근거는 마지막 사용자 발화 바로 앞에 끼워 넣는다. tool 메시지로 주려면
     # tool_call_id 짝을 맞춰야 하는데, 평범한 컨텍스트로 줘도 모델은 똑같이 읽는다.

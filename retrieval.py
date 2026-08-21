@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from budget import call_cap
+from compress import pack
 from toolspec import call_key, normalize_args
 
 # 도구 언어 계약을 적용할 것인가. 0 이면 모델이 낸 인자를 그대로 쓴다(A/B 용).
@@ -167,42 +168,43 @@ class RetrievalResult:
     items: list[Evidence] = field(default_factory=list)
     tool_calls_used: int = 0
     trace: list[str] = field(default_factory=list)
+    # 무엇을 남길지는 질의에 달렸다. 압축 단계가 이 값을 조건으로 문단을 고른다.
+    query: str = ""
 
     def as_prompt(self, limit: int = 1400, budget: int | None = None) -> str:
         """generation 단계에 넘길 형태. 대시보드 예시의 모양을 따른다.
 
-        `budget` 은 근거 블록 **전체**의 글자 상한이다. 항목 하나가 20페이지
-        원문일 수 있어서 항목 수로는 못 막는다. 남은 몫을 항목들이 나눠 갖고,
-        더 담을 수 없으면 몇 개를 못 실었는지 밝힌다 — 조용히 자르면 모델이
-        가진 근거가 전부라고 믿는다.
+        가져온 것을 다 넣지 않는다. 도구 하나가 20~30KB 를 돌려주는데(실측),
+        그걸 그대로 얹으면 답을 쓸 시간과 출력 예산이 사라지고 긴 맥락의 가운데는
+        어차피 덜 읽힌다. 그래서 질의에 맞는 문단만 골라 예산 안에 담는다.
+        고르는 규칙은 compress.py 에 있다.
         """
         budget = EVIDENCE_BUDGET_CHARS if budget is None else budget
         lines = [f"status: {self.status}"]
         if self.note:
             lines.append(f"note: {self.note}")
-        used = sum(len(x) for x in lines)
-        shown = 0
-        for i, ev in enumerate(self.items, 1):
-            head = []
-            head.append("")
-            head.append(f"[{i}]")
+
+        head_room = sum(len(x) + 1 for x in lines)
+        packed = pack(
+            self.items,
+            self.query,
+            budget=max(0, budget - head_room),
+            per_item_cap=limit,
+        )
+        for i, (ev, text) in enumerate(packed, 1):
+            lines.append("")
+            lines.append(f"[{i}]")
             if ev.source_type:
-                head.append(f"source_type: {ev.source_type}")
+                lines.append(f"source_type: {ev.source_type}")
             if ev.url:
-                head.append(f"url: {ev.url}")
+                lines.append(f"url: {ev.url}")
             if ev.title:
-                head.append(f"title: {ev.title}")
-            head_len = sum(len(x) + 1 for x in head)
-            room = budget - used - head_len
-            if room <= 200:
-                break
-            text = ev.text[: min(limit, room)]
-            lines.extend(head)
+                lines.append(f"title: {ev.title}")
             lines.append(f"content: {text}")
-            used += head_len + len(text) + 9
-            shown += 1
-        dropped = len(self.items) - shown
+
+        dropped = len(self.items) - len(packed)
         if dropped > 0:
+            # 조용히 자르면 모델이 받은 것이 전부라고 믿는다.
             lines.append(
                 f"\n({dropped} more retrieved items were not included here "
                 f"because of the evidence budget.)"
@@ -297,7 +299,7 @@ async def run_retrieval(
     `deadline` 을 주면 남은 시간을 보며 스스로 멈춘다. 답을 쓸 시간(`reserve`)은
     반드시 남긴다 — 근거를 더 모으다 답을 못 쓰면 그 문항은 0점이다.
     """
-    res = RetrievalResult()
+    res = RetrievalResult(query=query)
     if not tool_names:
         res.status = "no_evidence"
         res.note = "no retrieval tools for this domain"
