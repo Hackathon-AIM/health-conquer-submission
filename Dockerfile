@@ -29,7 +29,7 @@ COPY data/ ./data/
 ENV LUNIT_FM_API_KEY="lunit_afGfOD-9oZq2Obeez2NfkrxRRCsN7T4a6G0Gw4JCSjQ" \
     PYTHONPATH=/app/src \
     PYTHONUNBUFFERED=1 \
-    MEDAI_CONFIG=configs/l2_live.yaml \
+    MEDAI_CONFIG=configs/l2_raw.yaml \
     HOST=0.0.0.0 \
     PORT=8000
 
