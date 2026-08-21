@@ -185,11 +185,43 @@ async def generate_reply(messages: list[dict], dl: Deadline) -> str:
     content = (choice["message"].get("content") or "").strip()
     if choice.get("finish_reason") == "length" or not content:
         log.info(
-            "thinking 응답 손상 — 기존 경로로 폴백 (finish=%s content=%d elapsed=%.1fs)",
+            "thinking 응답 손상 — 부분 답변 이어쓰기 시도 (finish=%s content=%d elapsed=%.1fs)",
             choice.get("finish_reason"),
             len(content),
             dl.elapsed,
         )
+        if content:
+            continuation_messages = [
+                *forwarded,
+                {"role": "assistant", "content": content},
+            ]
+            continuation_data = await call_fm(
+                continuation_messages,
+                MAX_TOKENS,
+                {
+                    "chat_template_kwargs": {
+                        "enable_thinking": False,
+                        "continue_final_message": True,
+                    }
+                },
+            )
+            continuation_choice = continuation_data["choices"][0]
+            continuation = continuation_choice["message"].get("content") or ""
+            if continuation_choice.get("finish_reason") != "length" and continuation.strip():
+                completed = f"{content}{continuation}"
+                log.info(
+                    "부분 답변 이어쓰기 성공 (partial=%d continuation=%d total=%d elapsed=%.1fs)",
+                    len(content),
+                    len(continuation),
+                    len(completed),
+                    dl.elapsed,
+                )
+                return completed
+            log.info(
+                "부분 답변 이어쓰기도 손상 — 기존 경로로 폴백 (finish=%s continuation=%d)",
+                continuation_choice.get("finish_reason"),
+                len(continuation),
+            )
         data = await call_fm(
             forwarded,
             MAX_TOKENS,
