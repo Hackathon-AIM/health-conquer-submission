@@ -122,6 +122,10 @@ sim:
 l2-smoke:
 	$(PY) scripts/l2_smoke.py
 
+# 직접 대화해본다 (멀티턴 유지 · 추적 표시 · /raw 로 순수 L2 비교)
+chat:
+	$(PY) scripts/chat.py
+
 # ── 제출 (docs/submission.md) ───────────────────────────────
 submit-check:
 	$(PY) scripts/submit_check.py
