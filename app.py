@@ -169,13 +169,23 @@ async def call_fm(
     raise last
 
 
-async def generate_reply(messages: list[dict], dl: Deadline) -> str:
-    """Use a completed thinking response, otherwise fall back to the 43-point path."""
-    forwarded = [dict(message) for message in messages]
-    if forwarded and forwarded[-1].get("role") == "user":
-        content = forwarded[-1].get("content")
+def prepare_messages(messages: list[dict]) -> list[dict]:
+    """Attach ANSWER_INSTRUCTION to the latest user turn.
+
+    Returns a new list; the caller's message objects are never mutated. Every
+    generation path — including the outer timeout fallback — must send these
+    prepared messages, or that request silently loses the instruction.
+    """
+    prepared = [dict(message) for message in messages]
+    if prepared and prepared[-1].get("role") == "user":
+        content = prepared[-1].get("content")
         if isinstance(content, str):
-            forwarded[-1]["content"] = f"{content}\n\n[{ANSWER_INSTRUCTION}]"
+            prepared[-1]["content"] = f"{content}\n\n[{ANSWER_INSTRUCTION}]"
+    return prepared
+
+
+async def generate_reply(forwarded: list[dict], dl: Deadline) -> str:
+    """Use a completed thinking response, otherwise fall back to the 43-point path."""
     data = await call_fm(
         forwarded,
         MAX_TOKENS,
@@ -204,18 +214,19 @@ async def generate_reply(messages: list[dict], dl: Deadline) -> str:
 @app.post("/v1/chat/completions")
 async def chat_completions(body: dict) -> dict[str, Any]:
     messages = body.get("messages") or []
+    forwarded = prepare_messages(messages)
     dl = Deadline.start(REQUEST_BUDGET_S)
     try:
         # 단계마다 남은 시간을 보며 스스로 줄이지만, 그래도 넘기면 여기서 끊는다.
         content = await asyncio.wait_for(
-            generate_reply(messages, dl), timeout=REQUEST_BUDGET_S + 20
+            generate_reply(forwarded, dl), timeout=REQUEST_BUDGET_S + 20
         )
     except asyncio.TimeoutError:
         # 여기서 빈 문자열을 흘리면 그 문항은 0점이다. 도구도 라우팅도 없이
         # 한 번만 더, 짧게 답을 받아 본다. 늦은 답이 없는 답보다 낫다.
         log.error("요청 시간 초과 — 직답으로 되살린다 (elapsed=%.1fs)", dl.elapsed)
         try:
-            data = await asyncio.wait_for(call_fm(messages, MAX_TOKENS), timeout=60)
+            data = await asyncio.wait_for(call_fm(forwarded, MAX_TOKENS), timeout=60)
             content = (data["choices"][0]["message"].get("content") or "").strip()
         except Exception:
             log.exception("직답 폴백도 실패")
