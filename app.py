@@ -170,14 +170,32 @@ async def call_fm(
 
 
 async def generate_reply(messages: list[dict], dl: Deadline) -> str:
-    """최신 사용자 질문에 한정된 답변 행동 지시를 붙여 L2에 전달한다."""
+    """Use a completed thinking response, otherwise fall back to the 43-point path."""
     forwarded = [dict(message) for message in messages]
     if forwarded and forwarded[-1].get("role") == "user":
         content = forwarded[-1].get("content")
         if isinstance(content, str):
             forwarded[-1]["content"] = f"{content}\n\n[{ANSWER_INSTRUCTION}]"
-    data = await call_fm(forwarded, MAX_TOKENS)
-    content = (data["choices"][0]["message"].get("content") or "").strip()
+    data = await call_fm(
+        forwarded,
+        MAX_TOKENS,
+        {"chat_template_kwargs": {"enable_thinking": True}},
+    )
+    choice = data["choices"][0]
+    content = (choice["message"].get("content") or "").strip()
+    if choice.get("finish_reason") == "length" or not content:
+        log.info(
+            "thinking 응답 손상 — 기존 경로로 폴백 (finish=%s content=%d elapsed=%.1fs)",
+            choice.get("finish_reason"),
+            len(content),
+            dl.elapsed,
+        )
+        data = await call_fm(
+            forwarded,
+            MAX_TOKENS,
+            {"chat_template_kwargs": {"enable_thinking": False}},
+        )
+        content = (data["choices"][0]["message"].get("content") or "").strip()
     if not content:
         log.error("L2 raw 응답의 content가 비었다 — elapsed=%.1fs", dl.elapsed)
     return content
