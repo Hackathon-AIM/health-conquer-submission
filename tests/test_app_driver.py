@@ -47,6 +47,7 @@ class AppDriverTests(unittest.TestCase):
             {"chat_template_kwargs": {"enable_thinking": False}},
         )
         self.assertIn(driver_app.ANSWER_INSTRUCTION, calls[1][0][-1]["content"])
+        self.assertIn("latest question directly", calls[1][0][-1]["content"])
 
     def test_generate_reply_falls_back_when_thinking_content_is_empty(self) -> None:
         calls: list[dict[str, Any] | None] = []
@@ -247,6 +248,34 @@ class AppDriverTests(unittest.TestCase):
 
         self.assertEqual(answer, "직접 답변")
 
+    def test_optional_mcp_is_disabled_by_default_even_for_gate_question(self) -> None:
+        async def fake_generate_reply(
+            _messages: list[dict[str, Any]],
+            _deadline: Deadline,
+        ) -> str:
+            return "직접 답변"
+
+        async def fail_generate(*_args, **_kwargs) -> tuple[str, Any]:
+            raise AssertionError("MCP path should not run when disabled")
+
+        original_enabled = driver_app.MCP_ENABLED
+        original_reply = driver_app.generate_reply
+        original_generate = driver_app.generate
+        driver_app.MCP_ENABLED = False
+        driver_app.generate_reply = fake_generate_reply
+        driver_app.generate = fail_generate
+        try:
+            answer = asyncio.run(driver_app.answer_with_optional_mcp(
+                [{"role": "user", "content": "아스피린과 와파린 병용 금기 근거 알려줘"}],
+                Deadline.start(40),
+            ))
+        finally:
+            driver_app.MCP_ENABLED = original_enabled
+            driver_app.generate_reply = original_reply
+            driver_app.generate = original_generate
+
+        self.assertEqual(answer, "직접 답변")
+
     def test_optional_mcp_falls_back_to_direct_when_mcp_path_fails(self) -> None:
         async def fail_generate(*_args, **_kwargs) -> tuple[str, Any]:
             raise RuntimeError("mcp down")
@@ -259,6 +288,8 @@ class AppDriverTests(unittest.TestCase):
 
         original_generate = driver_app.generate
         original_reply = driver_app.generate_reply
+        original_enabled = driver_app.MCP_ENABLED
+        driver_app.MCP_ENABLED = True
         driver_app.generate = fail_generate
         driver_app.generate_reply = fake_generate_reply
         try:
@@ -267,6 +298,7 @@ class AppDriverTests(unittest.TestCase):
                 Deadline.start(40),
             ))
         finally:
+            driver_app.MCP_ENABLED = original_enabled
             driver_app.generate = original_generate
             driver_app.generate_reply = original_reply
 

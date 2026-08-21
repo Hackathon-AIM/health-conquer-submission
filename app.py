@@ -49,6 +49,7 @@ MCP_FINAL_MAX_TOKENS = min(int(os.environ.get("FM_MCP_FINAL_MAX_TOKENS", "900"))
 TIMEOUT = float(os.environ.get("FM_TIMEOUT", "120"))
 FM_RETRIES = int(os.environ.get("FM_RETRIES", "3"))
 FM_BACKOFF = float(os.environ.get("FM_BACKOFF", "1.5"))
+MCP_ENABLED = os.environ.get("MCP_ENABLED", "0") == "1"
 
 # retrieval 단계에서 허용할 MCP 도구 호출 수. 대시보드 팁이 "제한하라"고 명시한다.
 RETRIEVAL_BUDGET = int(os.environ.get("RETRIEVAL_BUDGET", "3"))
@@ -78,7 +79,12 @@ ENABLE_THINKING = os.environ.get("FM_THINKING", "0") == "1"
 # separate system message. Keep this deliberately narrow: it prevents a generic
 # referral from replacing an otherwise answerable medical response.
 ANSWER_INSTRUCTION = (
-    "Answer directly and concisely. Do not give a referral-only answer."
+    "Use the full conversation context and answer the latest question directly in the user's language. "
+    "Silently check the key medical reasoning, missing assumptions, and any relevant red flags before "
+    "writing, but do not reveal hidden reasoning. Give a complete practical answer: what is most likely "
+    "or recommended, why, what to do next, and when urgent care or clinician review is specifically "
+    "needed. Keep the final answer concise, usually 4-7 sentences in one or two short paragraphs. "
+    "Avoid headings and long lists unless the user explicitly asks for them. Avoid a referral-only answer."
 )
 
 _EVIDENCE_RE = re.compile(
@@ -148,11 +154,12 @@ async def lifespan(_: FastAPI):
     if not FM_KEY:
         log.error("LUNIT_FM_API_KEY 가 비어 있다. 모든 생성 요청이 실패한다.")
     log.info(
-        "driver up — model=%s max_tokens=%d direct_tokens=%d mcp_final_tokens=%d thinking=%s budget=%.0fs fm_conc=%d mcp_conc=%d",
+        "driver up — model=%s max_tokens=%d direct_tokens=%d mcp_final_tokens=%d mcp=%s thinking=%s budget=%.0fs fm_conc=%d mcp_conc=%d",
         FM_MODEL,
         MAX_TOKENS,
         DIRECT_MAX_TOKENS,
         MCP_FINAL_MAX_TOKENS,
+        MCP_ENABLED,
         ENABLE_THINKING,
         REQUEST_BUDGET_S,
         FM_CONCURRENCY,
@@ -306,6 +313,9 @@ def _last_resort_answer(messages: list[dict]) -> str:
 
 
 async def answer_with_optional_mcp(messages: list[dict], dl: Deadline) -> str:
+    if not MCP_ENABLED:
+        return await generate_reply(messages, dl)
+
     route = _mcp_route(messages)
     if route is None:
         return await generate_reply(messages, dl)

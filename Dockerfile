@@ -5,6 +5,7 @@ ENV PYTHONUNBUFFERED=1 \
     LUNIT_MCP_URL=https://mcp.hackathon.lunit.io/mcp \
     LUNIT_FM_MODEL=Lunit/L2-preview \
     LUNIT_FM_API_KEY=lunit_dFthkHMh2_gB2aVIo_mi5jznWpHoXbU2a2Od4hlVtf4 \
+    MCP_ENABLED=0 \
     FM_DIRECT_MAX_TOKENS=1100 \
     FM_MCP_FINAL_MAX_TOKENS=900 \
     HARNESS_MODEL_NAME=medai
