@@ -71,8 +71,22 @@ ENABLE_THINKING = os.environ.get("FM_THINKING", "0") == "1"
 # L2 follows task instructions in the latest user turn more reliably than a
 # separate system message. Keep this deliberately narrow: it prevents a generic
 # referral from replacing an otherwise answerable medical response.
+# 완결성(coverage) 지시. 추가 FM 호출 0회.
+# 근거 — healthbench_main 5,000건 · 루브릭 57,237개 실측:
+#   completeness 38.9% (22,285개) · accuracy 33.0% · context_awareness 15.7%
+#   감점 루브릭 30.7%(17,575개)이고 대부분 "Fails to mention / Does not advise" 형태.
+# completeness 루브릭이 반복 요구하는 항목 (22,285개 중):
+#   악화징후·언제 병원에 15.3% · 지지요법 5.5% · 위험/부작용 5.2%
+#   용량 3.0% · 모니터링/추적 2.9% · 검사 2.7% · 감별원인 2.1% · 되묻기 2.0%
+# 길이는 지시하지 않는다 — 짧게 쓰라고 했더니 로컬 A/B에서 0.6008→0.5156 으로 졌다.
 ANSWER_INSTRUCTION = (
-    "Do not substitute 'consult a professional' for an answer; answer as far as you can."
+    "Do not substitute 'consult a professional' for an answer; answer as far as you can. "
+    "Address every part of what was asked: if the user raises two concerns, cover both. "
+    "Where they genuinely apply to this question, also include: the warning signs that mean "
+    "urgent or emergency care is needed; what the person can do themselves in the meantime; "
+    "the main risks or side effects; how to monitor progress and when to follow up, and with "
+    "whom. If a missing detail would change your answer, ask for it. Do not pad, but do not "
+    "leave out any of the above that genuinely applies."
 )
 
 _fm_sem = asyncio.Semaphore(FM_CONCURRENCY)
