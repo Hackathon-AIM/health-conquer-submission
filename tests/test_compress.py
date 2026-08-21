@@ -71,6 +71,66 @@ def test_numeric_paragraph_is_preferred_on_a_tie() -> None:
     assert "1,000mg" in out, out
 
 
+def test_threshold_paragraph_wins_over_the_question_echo() -> None:
+    """이 프로젝트에서 실제로 당한 실패다.
+
+    질의어 겹침만 보면 **질문을 되풀이하는 문단**이 이긴다. 실측:
+      질의 "low risk prostate cancer active surveillance eligibility criteria"
+      원문 27,031자 → 프롬프트 1,616자
+      PSA 34회→0 · Gleason 17회→0 · 10 ng/mL 2회→0
+      살아남은 것은 surveillance 11회 — 답이 아니라 질문의 메아리였다.
+
+    진짜 문서에서는 질문의 단어가 **문서 전체에 흔하다**. 그래서 그 단어로는
+    어느 문단이 답인지 못 가른다. 답이 든 문단은 대신 측정값과 조건을 쓴다.
+    아래 데이터는 그 조건을 그대로 흉내 낸다.
+    """
+    q = "low risk prostate cancer active surveillance eligibility criteria"
+    echo = (
+        "Active surveillance is an accepted management strategy for low risk prostate "
+        "cancer. Eligibility criteria for active surveillance vary between guidelines."
+    )
+    # 문서 곳곳에서 같은 말을 반복한다 — 실제 가이드라인이 그렇다.
+    filler = [
+        f"Section {i}: active surveillance in low risk prostate cancer is discussed. "
+        "Criteria for surveillance are covered elsewhere in this chapter."
+        for i in range(12)
+    ]
+    answer = (
+        "Patients are eligible when PSA < 10 ng/mL, ISUP grade 1, and clinical stage "
+        "cT1c. Confirmatory biopsy is advised, and PSA density below 0.15 ng/mL "
+        "supports enrolment. Repeat PSA every 6 months."
+    )
+    doc = "\n\n".join([echo] + filler + [answer])
+    out, _ = C.prune_text(doc, q, budget=len(answer) + 150)
+    assert "PSA < 10 ng/mL" in out, out[:400]
+
+
+def test_fact_density_beats_a_query_echo_without_numbers() -> None:
+    q = "타이레놀 성인 최대 용량"
+    echo = "타이레놀 성인 최대 용량에 대해 아래에서 설명한다. 성인 용량은 중요한 주제다."
+    answer = "1회 1,000mg, 1일 4,000mg 을 초과하지 않는다. 간질환 환자는 2,000mg 이하."
+    assert C.fact_density(answer) > C.fact_density(echo)
+    scores = C.score_paragraphs([echo, answer], q)
+    assert scores[1] > scores[0], scores
+
+
+def test_common_words_are_discounted() -> None:
+    """문서 전체에 나오는 말은 어느 문단이 답인지 못 가른다 (IDF)."""
+    q = "surveillance criteria"
+    common = ["surveillance is discussed in this section as well. " * 3] * 10
+    rare = "criteria: PSA density 0.15 ng/mL and grade group 1."
+    scores = C.score_paragraphs(common + [rare], q)
+    assert scores[-1] > max(scores[:-1]), scores[-3:]
+
+
+def test_single_item_uses_the_whole_budget() -> None:
+    """근거가 하나뿐인데 항목 상한에 묶여 예산의 35%만 쓰고 있었다."""
+    big = Ev(text="\n\n".join([NOISE] * 40))
+    packed = C.pack([big], Q, budget=4000, per_item_cap=1400)
+    kept = sum(len(t) for _, t in packed)
+    assert kept > 2000, f"예산 4000 중 {kept}자만 썼다"
+
+
 def test_short_text_is_untouched() -> None:
     out, dropped = C.prune_text(ANSWER, Q, budget=10_000)
     assert out == ANSWER and dropped == 0

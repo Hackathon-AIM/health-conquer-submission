@@ -53,14 +53,39 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import re
+from collections import Counter
 from typing import Iterable
 
 # 문단 경계. 표·목록이 많아 빈 줄과 단독 줄바꿈을 모두 본다.
 _PARA_SPLIT = re.compile(r"\n\s*\n|\r\n\s*\r\n")
 _HANGUL = re.compile(r"[가-힣]")
-# 점수 가중 대상: 숫자(용량·연도·조문), 단위, 코드, 영문 용어.
+# ── 답을 결정하는 신호 ────────────────────────────────────────
+#
+# 질의어 겹침만 보면 **질문을 되풀이하는 문단**이 이긴다. 실측에서 그대로 당했다:
+#   질의 "low risk prostate cancer active surveillance eligibility criteria"
+#   원문 27,031자 → 프롬프트 1,616자
+#   PSA 34회→0 · Gleason 17회→0 · 10 ng/mL 2회→0 · density 7회→0
+#   살아남은 것은 surveillance 11회 · criteria 2회 — 답이 아니라 질문의 메아리다.
+#
+# 답이 든 문단은 대개 질문의 단어를 쓰지 않는다. 대신 **측정값과 비교 조건**을
+# 쓴다: 'PSA < 10 ng/mL', 'ISUP grade 1', '1일 4,000mg 이하', '65세 이상'.
+# 그래서 두 축으로 점수를 낸다 — 질의 겹침(IDF 가중)과 사실 밀도.
 _NUMERIC = re.compile(r"\d")
+# 단위가 붙은 수치. 이게 있으면 그 문단은 기준·용량·가격을 말하고 있다.
+_MEASURE = re.compile(
+    r"\d+(?:[.,]\d+)?\s*"
+    r"(?:mg|g|kg|ml|mL|L|ng/mL|mg/dL|mmHg|mmol|mEq|IU|mcg|µg|%|개월|세|점|년|일|회|원|정)"
+    r"|\d+\s*(?:ng|mcg)\s*/\s*(?:mL|dL)",
+    re.IGNORECASE,
+)
+# 조건·문턱. 답은 대개 '이상/이하/미만' 이나 등급으로 갈린다.
+_COMPARE = re.compile(
+    r"[<>≤≥]|이하|이상|미만|초과|이내|grade\s*\d|stage\s*[0-9IV]|"
+    r"Gleason\s*\d|ISUP\s*\d|cT\d|등급|기준|금기|제외",
+    re.IGNORECASE,
+)
 _TOKEN = re.compile(r"[가-힣]{2,}|[A-Za-z][A-Za-z\-]{2,}|\d+(?:[.,]\d+)?")
 
 _PARTICLES = (
@@ -101,25 +126,52 @@ def paragraphs(text: str, min_len: int = 30) -> list[str]:
     return out
 
 
-def score_paragraph(para: str, q_tokens: set[str]) -> float:
-    """질의어와 얼마나 겹치는가. 숫자가 든 문단을 조금 올린다.
+def fact_density(para: str) -> float:
+    """측정값·조건이 얼마나 촘촘한가. 0~1.
 
-    의료 질문에서 답을 결정하는 것은 대개 용량·연령·기준치·조문 번호처럼
-    숫자가 든 문장이다. 같은 점수면 그쪽을 남기는 편이 낫다.
+    질의어를 하나도 안 써도, 기준치가 빽빽한 문단은 답일 확률이 높다.
     """
-    if not q_tokens:
+    n = len(_MEASURE.findall(para)) + 0.7 * len(_COMPARE.findall(para))
+    if n <= 0:
         return 0.0
-    p_tokens = tokens(para)
-    if not p_tokens:
-        return 0.0
-    hit = len(q_tokens & p_tokens)
-    if hit == 0:
-        return 0.0
-    # 길이로 나눠 장황한 문단이 겹침 수만으로 이기지 않게 한다.
-    density = hit / (len(p_tokens) ** 0.5)
-    if _NUMERIC.search(para):
-        density *= 1.25
-    return density
+    # 길이로 정규화하되 상한을 둔다 — 표 한 줄이 문서를 다 이기면 안 된다.
+    per_kchar = n / max(1.0, len(para) / 500.0)
+    return min(1.0, per_kchar / 4.0)
+
+
+def score_paragraphs(paras: list[str], query: str) -> list[float]:
+    """문단들에 점수를 매긴다. 문서 전체를 봐야 하므로 하나씩이 아니라 묶어서 낸다.
+
+    두 축을 더한다.
+      · 질의 겹침 — 다만 **문서 안에서 흔한 말은 깎는다**(IDF). 63개 문단에
+        다 나오는 "surveillance" 는 어느 문단이 답인지 못 가른다.
+      · 사실 밀도 — 단위 붙은 수치와 비교 조건. 질의어가 없어도 여기서 산다.
+    """
+    q = tokens(query)
+    para_tokens = [tokens(p) for p in paras]
+    df: Counter = Counter()
+    for pt in para_tokens:
+        for w in pt:
+            df[w] += 1
+    n_docs = max(1, len(paras))
+
+    out: list[float] = []
+    for para, pt in zip(paras, para_tokens):
+        lex = 0.0
+        if q and pt:
+            for w in q & pt:
+                # 문서 안에서 드문 말일수록 크게 친다.
+                lex += math.log(1.0 + n_docs / (1.0 + df[w]))
+            lex /= max(1.0, len(pt) ** 0.5)
+        # 두 축을 같은 눈금(0~1)으로 맞춘 뒤 더한다.
+        #
+        # 안 맞추면 어휘 축이 상한 없이 커져서 사실 축을 덮는다. 실측한 숫자:
+        #   질문을 되풀이하는 문단  lex 1.79 · fact 0.00
+        #   기준치가 든 문단        lex 0.00 · fact 1.00
+        # 가중치를 1.2 로 줬는데도 메아리가 이겼다. 질문을 되풀이하는 것만으로는
+        # 답이 아니므로, 사실 축을 조금 더 무겁게 둔다.
+        out.append(0.6 * min(1.0, lex / 2.0) + 0.9 * fact_density(para))
+    return out
 
 
 def prune_text(text: str, query: str, budget: int) -> tuple[str, int]:
@@ -133,9 +185,9 @@ def prune_text(text: str, query: str, budget: int) -> tuple[str, int]:
     paras = paragraphs(text)
     if not paras:
         return text[:budget], 0
-    q = tokens(query)
+    scores = score_paragraphs(paras, query)
     scored = sorted(
-        ((score_paragraph(p, q), i, p) for i, p in enumerate(paras)),
+        ((s, i, p) for (s, (i, p)) in zip(scores, enumerate(paras))),
         key=lambda x: (-x[0], x[1]),
     )
     picked: list[tuple[int, str]] = []
@@ -196,7 +248,11 @@ def pack(
         uniq.append(it)
 
     # 2) 균등 배분. 한 항목이 20페이지라고 나머지를 굶기지 않는다.
-    share = max(300, min(per_item_cap, budget // max(1, len(uniq))))
+    #
+    # 다만 항목이 적으면 상한을 풀어 예산을 다 쓴다. 근거가 하나뿐인데
+    # per_item_cap 에 묶여 4,000자 예산 중 1,400자만 쓰고 나머지를 버리고 있었다.
+    even = budget // max(1, len(uniq))
+    share = max(300, min(max(per_item_cap, even), even if len(uniq) > 1 else budget))
 
     packed: list[tuple[object, str]] = []
     used = 0
