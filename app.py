@@ -68,13 +68,6 @@ MCP_CONCURRENCY = int(os.environ.get("MCP_CONCURRENCY", "12"))
 # 상한이 2048 로 묶여 있는 한, thinking 을 켜면 긴 답변은 구조적으로 완결될 수 없다.
 ENABLE_THINKING = os.environ.get("FM_THINKING", "0") == "1"
 
-# L2 follows task instructions in the latest user turn more reliably than a
-# separate system message. Keep this deliberately narrow: it prevents a generic
-# referral from replacing an otherwise answerable medical response.
-ANSWER_INSTRUCTION = (
-    "Do not substitute 'consult a professional' for an answer; answer as far as you can."
-)
-
 _fm_sem = asyncio.Semaphore(FM_CONCURRENCY)
 _client: httpx.AsyncClient | None = None
 # MCP 도 같은 팀 키를 쓴다. 모듈 로드 시점의 환경변수를 각자 읽게 두면
@@ -170,13 +163,8 @@ async def call_fm(
 
 
 async def generate_reply(messages: list[dict], dl: Deadline) -> str:
-    """최신 사용자 질문에 한정된 답변 행동 지시를 붙여 L2에 전달한다."""
-    forwarded = [dict(message) for message in messages]
-    if forwarded and forwarded[-1].get("role") == "user":
-        content = forwarded[-1].get("content")
-        if isinstance(content, str):
-            forwarded[-1]["content"] = f"{content}\n\n[{ANSWER_INSTRUCTION}]"
-    data = await call_fm(forwarded, MAX_TOKENS)
+    """Evaluator의 대화를 수정하지 않고 L2에 그대로 전달하는 기준선."""
+    data = await call_fm(messages, MAX_TOKENS)
     content = (data["choices"][0]["message"].get("content") or "").strip()
     if not content:
         log.error("L2 raw 응답의 content가 비었다 — elapsed=%.1fs", dl.elapsed)
