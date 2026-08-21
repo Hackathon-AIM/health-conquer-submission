@@ -46,14 +46,25 @@ FM_URL = os.environ.get("LUNIT_FM_API_URL", "https://model.hackathon.lunit.io").
 FM_KEY = os.environ.get("LUNIT_FM_API_KEY", "").strip() or _FALLBACK_KEY
 FM_MODEL = os.environ.get("LUNIT_FM_MODEL", "Lunit/L2-preview")
 
-# 서버 상한 실측: 32768 은 200, 32769 는 400 "max_tokens exceeds 32768".
-# 2048 이라는 전제 때문에 thinking 응답이 늘 finish=length 로 잘려 폴백으로 떨어지고
-# 있었다. 팀 실측(동시 30, 같은 트리 두 벌):
-#   2048 → thinking 폴백 5회 · 평균 1673자 · 37.4s
-#   4096 → thinking 폴백 0회 · 평균 1773자 · 38.5s
-# 4096 을 넘기지 않는 이유는 REQUEST_BUDGET_S+20 = 60초 하드컷 때문이다.
+# ── 출력 예산 ────────────────────────────────────────────────
+#
+# 컨텍스트 창은 병목이 아니다. 실측: max_model_len=131072 이고 프롬프트
+# 60,016 토큰도 200 이 온다. conquer_val 프롬프트는 중앙 500자·최대 4,216자라
+# 창의 0.4% 도 안 쓴다. 상한은 max_tokens 32768 (32769 는 400) 과, 그와 별개인
+# 메시지 바이트 한도(아주 큰 단일 메시지에서 message_too_large)뿐이다.
+#
+# 진짜 희소 자원은 **max_tokens 안에서 thinking 과 답변이 나눠 쓰는 몫**이다.
+# 같은 12문항을 max_tokens 별로 재보면:
+#   2048  잘림 1/12 · thinking 비중 48% · 답변 중앙 3343자 · 지연 중앙 31.3s
+#   4096  잘림 0/12 · thinking 비중 46% · 답변 중앙 3673자 · 지연 중앙 21.4s (최대 70.0s)
+#   6144  잘림 0/12 · thinking 비중 50% · 답변 중앙 2764자 · 지연 중앙 22.7s (최대 39.6s)
+#   8192  잘림 0/12 · thinking 비중 49% · 답변 중앙 2777자 · 지연 중앙 24.4s
+# 2048 만 잘리고, 그 위로는 지연이 사실상 평평하다. 6144 를 쓰는 이유는
+# 리더보드 설정(conquer_val.yaml)이 client max_tokens 를 6144 로 두고 있고,
+# 그 파일이 "4096 에서는 2% 가 예산을 전부 thinking 에 쓰고 빈 content 를
+# 돌려줬다" 고 적고 있기 때문이다. 빈 답은 확정 0점이다.
 SERVER_MAX_TOKENS = 32768
-MAX_TOKENS = min(int(os.environ.get("FM_MAX_TOKENS", "4096")), SERVER_MAX_TOKENS)
+MAX_TOKENS = min(int(os.environ.get("FM_MAX_TOKENS", "6144")), SERVER_MAX_TOKENS)
 TIMEOUT = float(os.environ.get("FM_TIMEOUT", "120"))
 FM_RETRIES = int(os.environ.get("FM_RETRIES", "3"))
 FM_BACKOFF = float(os.environ.get("FM_BACKOFF", "1.5"))
@@ -105,6 +116,18 @@ FM_CALL_CAP_S = float(os.environ.get("FM_CALL_CAP_S", "25"))
 # 답변 호출을 remaining 으로 깎았더니 6/30 이 빈 답(=0점)이 됐다.
 ANSWER_CAP_S = float(os.environ.get("ANSWER_CAP_S", "45"))
 ANSWER_FLOOR_S = float(os.environ.get("ANSWER_FLOOR_S", "25"))
+
+# ── thinking 을 켤 시간이 있는가 ──────────────────────────────
+#
+# 실측: 같은 12문항에서 thinking 을 켜면 지연 중앙 21.4s(최대 70.0s), 끄면
+# 5.3s(최대 17.1s) 다. 4배다. 답변 길이는 3673자 대 1749자로 두 배 차이라
+# 켜는 쪽이 기본적으로 유리하지만, **남은 시간이 없을 때는 얘기가 다르다.**
+# 20초 남은 상태에서 thinking 을 켜면 대개 아무것도 못 받고, 그 문항은
+# 짧은 답이 아니라 빈 답이 된다.
+#
+# 그래서 남은 시간이 이 값보다 적으면 처음부터 thinking 없이 간다.
+# 사후 폴백(잘리면 다시 부르기)과 다르다 — 그쪽은 이미 시간을 다 쓴 뒤다.
+THINKING_MIN_S = float(os.environ.get("THINKING_MIN_S", "26"))
 
 # 어떤 이유로든 본 경로가 실패했을 때의 구조 호출. 이 호출의 목적은 품질이
 # 아니라 0점 회피다.
@@ -328,6 +351,22 @@ async def _draft_raw(messages: list[dict], dl: Deadline) -> tuple[str, str, int,
     """
     forwarded = _with_answer_instruction(messages)
     cap = answer_timeout(dl, ANSWER_CAP_S, ANSWER_FLOOR_S) if DEADLINE_GUARD else None
+
+    # 남은 시간이 thinking 을 감당 못 하면 처음부터 켜지 않는다.
+    if DEADLINE_GUARD and dl.remaining() < THINKING_MIN_S:
+        log.info(
+            "thinking 생략 — 남은 %.1fs < %.0fs (짧아도 답이 있는 편이 낫다)",
+            dl.remaining(), THINKING_MIN_S,
+        )
+        data = await call_fm(
+            forwarded,
+            MAX_TOKENS,
+            {"chat_template_kwargs": {"enable_thinking": False}},
+            timeout=cap,
+        )
+        content = (data["choices"][0]["message"].get("content") or "").strip()
+        return content, _lang_of(_last_user_text(messages)), 0, ""
+
     try:
         data = await call_fm(
             forwarded,

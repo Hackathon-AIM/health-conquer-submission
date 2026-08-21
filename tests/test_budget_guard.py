@@ -283,6 +283,64 @@ def test_rescue_covers_non_timeout_errors() -> None:
     assert got == "되살린 답변입니다.", f"구조 경로가 안 돌았다: {got!r}"
 
 
+# ── 8. 근거 블록이 출력 예산을 갉아먹지 않는다 ────────────────
+def test_evidence_block_respects_its_budget() -> None:
+    """근거는 입력 컨텍스트가 아니라 **출력 예산**을 먹는다.
+
+    창은 131k 라 넣는 데는 문제가 없다. 문제는 근거가 길수록 모델이 사고에 쓰는
+    몫이 커지고, 그 몫이 답변 몫에서 나온다는 것이다.
+    """
+    from retrieval import Evidence, RetrievalResult
+
+    res = RetrievalResult(status="sufficient")
+    res.items = [Evidence(cite_uid=f"c{i}", title=f"t{i}", text="가" * 5000) for i in range(5)]
+    out = res.as_prompt(budget=4000)
+    assert len(out) <= 4400, len(out)
+    # 못 실은 항목이 있으면 그 사실을 밝힌다 — 조용히 자르면 모델이 이게 전부라고 믿는다.
+    assert "not included here" in out, out[-200:]
+
+
+def test_evidence_block_keeps_everything_when_it_fits() -> None:
+    from retrieval import Evidence, RetrievalResult
+
+    res = RetrievalResult(status="sufficient")
+    res.items = [Evidence(cite_uid="c1", title="t", text="짧은 근거")]
+    out = res.as_prompt(budget=4000)
+    assert "not included here" not in out
+    assert "짧은 근거" in out
+
+
+# ── 9. 시간이 없으면 thinking 을 처음부터 켜지 않는다 ─────────
+def test_thinking_is_skipped_when_time_is_short() -> None:
+    """실측: thinking 을 켜면 지연 중앙 21.4s(최대 70.0s), 끄면 5.3s 다.
+
+    20초 남은 상태에서 켜면 대개 아무것도 못 받고 그 문항은 빈 답이 된다.
+    사후 폴백과 다르다 — 그쪽은 이미 시간을 다 쓴 뒤에 도는 것이다.
+    """
+    import app as appmod
+
+    seen: list = []
+
+    async def fake_fm(messages, max_tokens, extra=None, timeout=None, **kw):
+        seen.append((extra or {}).get("chat_template_kwargs", {}).get("enable_thinking"))
+        return {"choices": [{"message": {"content": "짧은 답변입니다."}, "finish_reason": "stop"}]}
+
+    old_fm = appmod.call_fm
+    appmod.call_fm = fake_fm
+    try:
+        msgs = [{"role": "user", "content": "질문"}]
+        thin = Deadline(total=40.0, started=time.monotonic() - 30.0)  # 남은 10초
+        asyncio.run(appmod._draft_raw(msgs, thin))
+        assert seen == [False], f"시간이 없는데 thinking 을 켰다: {seen}"
+
+        seen.clear()
+        fresh = Deadline.start(40.0)
+        asyncio.run(appmod._draft_raw(msgs, fresh))
+        assert seen == [True], f"시간이 있는데 thinking 을 안 켰다: {seen}"
+    finally:
+        appmod.call_fm = old_fm
+
+
 # ── 러너 ──────────────────────────────────────────────────────
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

@@ -59,7 +59,15 @@ RETRIEVAL_STEP_CAP_S = float(os.environ.get("RETRIEVAL_STEP_CAP_S", "20"))
 # 도구 결과를 대화에 얹을 때의 길이. 이게 크면 다음 스텝의 프롬프트가 그만큼
 # 부풀고, 부푼 프롬프트는 그대로 지연이 된다 — 3스텝이면 앞 두 스텝의 결과를
 # 통째로 다시 보내는 셈이다.
-TOOL_RESULT_CHARS = int(os.environ.get("TOOL_RESULT_CHARS", "12000"))
+#
+# 입력 컨텍스트가 모자라서가 아니다(창은 131k 다). 근거가 길수록 모델이
+# 사고에 쓰는 몫이 커지고 — CoEval 문서도 RAG 컨텍스트가 있으면 thinking
+# 비중이 올라간다고 적는다 — 그 몫은 답변 몫에서 나온다.
+TOOL_RESULT_CHARS = int(os.environ.get("TOOL_RESULT_CHARS", "6000"))
+
+# generation 단계에 넘길 근거 블록의 총량. 항목 수가 아니라 글자 수로 막는다 —
+# 항목 하나가 20페이지 원문일 수도 있기 때문이다.
+EVIDENCE_BUDGET_CHARS = int(os.environ.get("EVIDENCE_BUDGET_CHARS", "4000"))
 
 # FM 왕복 상한. 도구 호출 예산과 별개로, 모델이 도구를 안 부르고 맴돌 때를 끊는다.
 RETRIEVAL_MAX_STEPS = int(os.environ.get("RETRIEVAL_MAX_STEPS", "4"))
@@ -160,21 +168,45 @@ class RetrievalResult:
     tool_calls_used: int = 0
     trace: list[str] = field(default_factory=list)
 
-    def as_prompt(self, limit: int = 1400) -> str:
-        """generation 단계에 넘길 형태. 대시보드 예시의 모양을 따른다."""
+    def as_prompt(self, limit: int = 1400, budget: int | None = None) -> str:
+        """generation 단계에 넘길 형태. 대시보드 예시의 모양을 따른다.
+
+        `budget` 은 근거 블록 **전체**의 글자 상한이다. 항목 하나가 20페이지
+        원문일 수 있어서 항목 수로는 못 막는다. 남은 몫을 항목들이 나눠 갖고,
+        더 담을 수 없으면 몇 개를 못 실었는지 밝힌다 — 조용히 자르면 모델이
+        가진 근거가 전부라고 믿는다.
+        """
+        budget = EVIDENCE_BUDGET_CHARS if budget is None else budget
         lines = [f"status: {self.status}"]
         if self.note:
             lines.append(f"note: {self.note}")
+        used = sum(len(x) for x in lines)
+        shown = 0
         for i, ev in enumerate(self.items, 1):
-            lines.append("")
-            lines.append(f"[{i}]")
+            head = []
+            head.append("")
+            head.append(f"[{i}]")
             if ev.source_type:
-                lines.append(f"source_type: {ev.source_type}")
+                head.append(f"source_type: {ev.source_type}")
             if ev.url:
-                lines.append(f"url: {ev.url}")
+                head.append(f"url: {ev.url}")
             if ev.title:
-                lines.append(f"title: {ev.title}")
-            lines.append(f"content: {ev.text[:limit]}")
+                head.append(f"title: {ev.title}")
+            head_len = sum(len(x) + 1 for x in head)
+            room = budget - used - head_len
+            if room <= 200:
+                break
+            text = ev.text[: min(limit, room)]
+            lines.extend(head)
+            lines.append(f"content: {text}")
+            used += head_len + len(text) + 9
+            shown += 1
+        dropped = len(self.items) - shown
+        if dropped > 0:
+            lines.append(
+                f"\n({dropped} more retrieved items were not included here "
+                f"because of the evidence budget.)"
+            )
         return "\n".join(lines)
 
 
