@@ -184,6 +184,8 @@ def main() -> None:
                 break
 
             ans = d["choices"][0]["message"]["content"]
+            # driver.py 는 비표준 필드를 기본으로 끈다 (평가 클라이언트 호환 우선).
+            # 로컬 검증 때만 MEDAI_TRACE=1 로 켜서 본다.
             trace = d.get("medai_trace") or {}
             history.append({"role": "assistant", "content": ans})
             lat_all.append(secs)

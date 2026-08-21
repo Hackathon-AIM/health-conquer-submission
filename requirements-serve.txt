@@ -1,12 +1,16 @@
 # 제출 컨테이너 전용 — 실행에 꼭 필요한 것만.
 #
-# 왜 requirements.txt 를 안 쓰나
-#   FlagEmbedding(BGE 리랭커)은 torch 를 끌고 와 이미지가 수 GB, 빌드가 수 분이다.
-#   L2 네이티브 경로에서는 우리가 검색·리랭킹을 하지 않으므로 전혀 필요 없다.
-#   pandas(사전 생성), langgraph(래퍼), pytest(테스트)도 런타임에 안 쓴다.
-#   빌드 5분 제한이 있으므로 넣지 않는 것이 곧 안전이다.
+# ⚠️ 버전 핀은 리더보드를 통과한 팀 requirements.txt(4c8cdc6, 29.13점)와 동일하게 맞춘다.
+#    평가 VM 에서 빌드·기동이 검증된 조합이므로 여기서 다르게 갈 이유가 없다.
+#
+# requirements.txt 를 안 쓰는 이유: FlagEmbedding(BGE 리랭커)이 torch 를 끌고 와
+# 이미지가 수 GB, 빌드가 수 분이다. L2 네이티브 경로에서는 리랭킹을 하지 않으므로
+# 전혀 필요 없다. 빌드 5분 제한이 있으니 안 넣는 것이 곧 안전이다.
+
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+httpx==0.28.1
 
 openai>=1.40      # L2 OpenAI 호환 엔드포인트 호출
-httpx>=0.27       # MCP Streamable HTTP 클라이언트
 pydantic>=2.7     # 계층 간 계약
 pyyaml>=6.0       # configs/*.yaml
