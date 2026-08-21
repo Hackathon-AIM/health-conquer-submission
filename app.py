@@ -15,6 +15,7 @@
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -164,6 +165,46 @@ ANSWER_INSTRUCTION = (
     "decisive detail is missing and your answer would change because of it, ask for that "
     "one thing, while still answering as far as you can without it."
 )
+
+# Frontier-only lookup gate.  The benchmark path is unchanged unless the latest
+# user turn is Korean and explicitly asks for one of the exact official-data
+# lookups that won the local A/B.  Broad HIRA guidance search and generic
+# DailyMed lookup are deliberately excluded: those arms lost to raw L2.
+_HANGUL_RE = re.compile(r"[가-힣]")
+_KCD_CODE_RE = re.compile(r"(?<![A-Za-z0-9])([A-Za-z]\d{2}(?:[.]\d{1,4})?)(?![A-Za-z0-9.])")
+_PRICE_RE = re.compile(r"(?:약가|상한금액|상한가|가격)")
+_MFDS_PERMISSION_RE = re.compile(
+    r"(?:식약처|MFDS).{0,24}(?:허가\s*(?:여부|상태|유효)|허가가\s*유효|허가.{0,10}유효)",
+    re.I,
+)
+_MFDS_INDICATION_RE = re.compile(r"(?:식약처|MFDS|허가).{0,30}(?:적응증|효능효과|허가사항)", re.I)
+_PRODUCT_BEFORE_TOPIC_RE = re.compile(
+    r"([가-힣A-Za-z][가-힣A-Za-z0-9+._-]{1,40})(?:의|은|는|이|가|을|를)?\s*"
+    r"(?:현재\s*)?(?:약가|상한금액|상한가|가격|식약처|MFDS|허가|적응증|효능효과)",
+    re.I,
+)
+_PRODUCT_POSSESSIVE_TOPIC_RE = re.compile(
+    r"([가-힣A-Za-z][가-힣A-Za-z0-9+._-]{1,40}?)(?:의|은|는|이|가|을|를)\s*"
+    r"(?:현재\s*)?(?:급여|비급여|약가|상한금액|상한가|가격|식약처|MFDS|허가|적응증|효능효과)",
+    re.I,
+)
+_INGREDIENT_RE = re.compile(r"([A-Za-z][A-Za-z -]{2,60}?)\s*성분", re.I)
+_PRODUCT_CONTEXT_RE = re.compile(
+    r"([가-힣A-Za-z][가-힣A-Za-z0-9+._-]{1,40}?)(?:을|를|으로|로)?\s*"
+    r"(?:복용|투여|처방|사용|시작|중단)",
+    re.I,
+)
+_DEICTIC_DRUG_RE = re.compile(r"(?:그|이|저)\s*(?:약|제품|의약품)")
+_DEICTIC_CODE_RE = re.compile(r"(?:그|이|저)\s*(?:코드|상병코드|질병코드)")
+_DEICTIC_INGREDIENT_RE = re.compile(r"(?:그|이|저)\s*성분")
+_KCD_NAME_RE = re.compile(
+    r"(?:KCD(?:-?\d+)?(?:에서|의)?\s*)?(.{2,45}?)(?:에\s*해당(?:할\s*가능성이\s*높은)?|의)?\s*"
+    r"(?:KCD(?:-?\d+)?\s*)?(?:진단|상병|질병)?\s*코드",
+    re.I,
+)
+_GENERIC_NAMES = {"현재", "국내", "제품", "의약품", "약", "그", "이", "저"}
+FRONTIER_EVIDENCE_CHARS = int(os.environ.get("FRONTIER_EVIDENCE_CHARS", "6000"))
+FRONTIER_MCP_TIMEOUT_S = float(os.environ.get("FRONTIER_MCP_TIMEOUT_S", "10"))
 
 _fm_sem = asyncio.Semaphore(FM_CONCURRENCY)
 _client: httpx.AsyncClient | None = None
@@ -339,30 +380,190 @@ def _lang_of(text: str) -> str:
     return "ko" if re.search(r"[가-힣]", text) else "en"
 
 
-# 멀티턴에서 답이 무너진다 — 실측:
-#   챔피언 자체   멀티턴 2,632자 vs 단일턴 4,859자 (54%)
-#   채점 기록     멀티턴 0.4540  vs 단일턴 0.6722  (n=442)
-# 루브릭 수는 같은데(12 vs 11) 답변만 짧다. healthbench_main 의 41.7% 가 멀티턴이다.
-#
-# 지시를 system 메시지로 옮겨봤더니 오히려 더 나빠졌다 — 멀티/단일 비율이
-# 54% → 34%. 그래서 위치는 그대로 두고(마지막 user 턴 접미) 구절만 더한다.
-MULTITURN_CLAUSE = (
-    "This is an ongoing conversation: the message above may be short or refer back to "
-    "something said earlier. Resolve what it refers to, then answer it with the same "
-    "depth you would give a standalone question — not as a brief chat reply."
-)
-
-
 def _with_answer_instruction(messages: list[dict]) -> list[dict]:
     """최신 사용자 턴에만 답변 행동 지시를 붙인다. 히스토리는 건드리지 않는다."""
     forwarded = [dict(message) for message in messages]
     if forwarded and forwarded[-1].get("role") == "user":
         content = forwarded[-1].get("content")
         if isinstance(content, str):
-            instruction = ANSWER_INSTRUCTION
-            if sum(1 for m in forwarded if m.get("role") in ("user", "assistant")) > 1:
-                instruction = f"{instruction} {MULTITURN_CLAUSE}"
-            forwarded[-1]["content"] = f"{content}\n\n[{instruction}]"
+            forwarded[-1]["content"] = f"{content}\n\n[{ANSWER_INSTRUCTION}]"
+    return forwarded
+
+
+def _named_product(text: str) -> str:
+    anchored = [match.group(1).strip() for match in _PRODUCT_POSSESSIVE_TOPIC_RE.finditer(text)]
+    anchored = [name for name in anchored if name not in _GENERIC_NAMES]
+    if anchored:
+        return anchored[0]
+    matches = [match.group(1).strip() for match in _PRODUCT_BEFORE_TOPIC_RE.finditer(text)]
+    matches = [name for name in matches if name not in _GENERIC_NAMES]
+    return matches[-1] if matches else ""
+
+
+def _kcd_disease_name(text: str) -> str:
+    match = _KCD_NAME_RE.search(text)
+    if not match:
+        return ""
+    name = match.group(1).strip(" ,.?요를은는이가")
+    # Avoid forwarding an entire question when the conservative extractor did
+    # not isolate a disease phrase.
+    return name if 2 <= len(name) <= 45 else ""
+
+
+def _unique_recent_entity(messages: list[dict], kind: str) -> str:
+    """Resolve one entity from recent user turns; ambiguity deliberately fails closed."""
+    current = _last_user_text(messages)
+    prior_users = [
+        str(message.get("content") or "")
+        for message in messages
+        if message.get("role") == "user" and str(message.get("content") or "") != current
+    ][-3:]
+    candidates: set[str] = set()
+    for text in prior_users:
+        if kind == "code":
+            candidates.update(match.group(1).upper() for match in _KCD_CODE_RE.finditer(text))
+        elif kind == "ingredient":
+            candidates.update(match.group(1).strip() for match in _INGREDIENT_RE.finditer(text))
+        elif kind == "drug":
+            named = _named_product(text)
+            if named and _looks_like_product_name(named):
+                candidates.add(named)
+            candidates.update(
+                match.group(1).strip()
+                for match in _PRODUCT_CONTEXT_RE.finditer(text)
+                if match.group(1).strip() not in _GENERIC_NAMES
+                and _looks_like_product_name(match.group(1).strip())
+            )
+    return next(iter(candidates)) if len(candidates) == 1 else ""
+
+
+def _looks_like_product_name(value: str) -> bool:
+    """Reject generic drug classes such as '혈압약' during deictic resolution."""
+    return bool(
+        re.search(
+            r"(?:정|주|캡슐|시럽|액|크림|연고|패치|산|과립|밀리그램|마이크로그램|mg|mcg)$",
+            value,
+            re.I,
+        )
+        or re.search(r"[A-Za-z]", value)
+    )
+
+
+def _resolve_deictic_lookup_text(messages: list[dict], current: str) -> str:
+    """Replace a single deictic target only when recent user context is unambiguous."""
+    if _DEICTIC_DRUG_RE.search(current):
+        entity = _unique_recent_entity(messages, "drug")
+        return _DEICTIC_DRUG_RE.sub(entity, current, count=1) if entity else current
+    if _DEICTIC_CODE_RE.search(current):
+        entity = _unique_recent_entity(messages, "code")
+        return _DEICTIC_CODE_RE.sub(entity, current, count=1) if entity else current
+    if _DEICTIC_INGREDIENT_RE.search(current):
+        entity = _unique_recent_entity(messages, "ingredient")
+        return _DEICTIC_INGREDIENT_RE.sub(f"{entity} 성분", current, count=1) if entity else current
+    return current
+
+
+def _select_frontier_lookup(messages: list[dict]) -> tuple[str, dict[str, Any]] | None:
+    """Map narrow Korean exact-lookups to one deterministic official tool."""
+    current = _last_user_text(messages)
+    if not current or not _HANGUL_RE.search(current):
+        return None
+    text = _resolve_deictic_lookup_text(messages, current)
+    # A deictic reference that could not be resolved must not be treated as a
+    # named product merely because words such as "그 약" occur near a topic.
+    if text == current and any(
+        pattern.search(current)
+        for pattern in (_DEICTIC_DRUG_RE, _DEICTIC_CODE_RE, _DEICTIC_INGREDIENT_RE)
+    ):
+        return None
+
+    code_match = _KCD_CODE_RE.search(text)
+    if code_match and re.search(r"(?:HIRA|심평원|청구|완전\s*코드|주상병|유효)", text, re.I):
+        return "openapi_hira_disease_check_code", {"code": code_match.group(1)}
+    if code_match and re.search(r"(?:KCD|공식.{0,8}(?:질병명|한글|영문))", text, re.I):
+        revision = "KCD-9" if re.search(r"KCD-?9", text, re.I) else "latest"
+        return "kcd_get_name", {"code": code_match.group(1), "revision": revision, "lang": "both"}
+
+    if re.search(r"KCD|상병\s*코드|질병\s*코드", text, re.I):
+        disease = _kcd_disease_name(text)
+        if disease:
+            revision = "KCD-9" if re.search(r"KCD-?9", text, re.I) else "latest"
+            return "kcd_search_codes", {
+                "name": disease,
+                "revision": revision,
+                "lang": "auto",
+                "top_k": 5,
+            }
+
+    product = _named_product(text)
+    if product and _PRICE_RE.search(text) and re.search(r"(?:급여|HIRA|심평원|약가|상한)", text, re.I):
+        return "openapi_hira_get_drug_price", {"drug_name": product, "num_rows": 5}
+
+    if product and _MFDS_PERMISSION_RE.search(text):
+        return "openapi_mfds_check_drug_permission", {"drug_name": product, "num_rows": 5}
+    if product and _MFDS_INDICATION_RE.search(text):
+        return "openapi_mfds_get_drug_indication", {
+            "drug_name": product,
+            "num_rows": 3,
+            "include_dosage": bool(re.search(r"용법|용량", text)),
+            "notice_clause": "",
+        }
+
+    ingredient = _INGREDIENT_RE.search(text)
+    if ingredient and re.search(r"(?:국내|식약처|MFDS).{0,30}(?:허가|제품)|(?:허가|제품).{0,30}(?:식약처|MFDS)", text, re.I):
+        return "openapi_mfds_find_drugs_by_ingredient", {
+            "ingredient": ingredient.group(1).strip(),
+            "num_rows": 8,
+        }
+    return None
+
+
+def _usable_evidence(result: Any) -> bool:
+    if result in (None, "", {}, []):
+        return False
+    if isinstance(result, dict) and isinstance(result.get("items"), list) and not result["items"]:
+        return False
+    rendered = json.dumps(result, ensure_ascii=False, default=str) if not isinstance(result, str) else result
+    lowered = rendered.lower()
+    return not any(marker in lowered for marker in ("returned http", "iserror", "not found", "upstream error"))
+
+
+async def _with_selective_frontier_evidence(messages: list[dict]) -> list[dict]:
+    """Attach bounded official evidence; on any miss return the raw path unchanged."""
+    forwarded = [dict(message) for message in messages]
+    spec = _select_frontier_lookup(messages)
+    if spec is None:
+        return forwarded
+    tool_name, arguments = spec
+    result: Any = None
+    for attempt in range(2):
+        try:
+            candidate = await MCP.call_tool(tool_name, arguments, timeout=FRONTIER_MCP_TIMEOUT_S)
+            if _usable_evidence(candidate):
+                result = candidate
+                break
+            log.info("선택적 MCP 빈/오류 근거 (%s, %d/2)", tool_name, attempt + 1)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "선택적 MCP 실패 (%s, %d/2: %s)", tool_name, attempt + 1, type(exc).__name__
+            )
+    if result is None:
+        log.info("선택적 MCP 근거 확보 실패 — raw 경로 유지 (%s)", tool_name)
+        return forwarded
+
+    rendered = json.dumps(result, ensure_ascii=False, separators=(",", ":"), default=str)
+    rendered = re.sub(r"[ \t]+", " ", rendered).strip()[:FRONTIER_EVIDENCE_CHARS]
+    for index in range(len(forwarded) - 1, -1, -1):
+        if forwarded[index].get("role") != "user":
+            continue
+        content = str(forwarded[index].get("content") or "")
+        forwarded[index]["content"] = (
+            f"{content}\n\n[한국 공식 자료 조회 결과]\n{rendered}\n"
+            "이 조회 결과로 확인되는 사실만 구체적으로 사용하세요. 결과에 없는 가격·코드·"
+            "허가·적응증은 추측하지 말고, 질문 전체를 뒷받침하지 못하면 그 한계를 밝히세요."
+        )
+        log.info("선택적 MCP 적용 — tool=%s evidence=%d", tool_name, len(rendered))
+        break
     return forwarded
 
 
@@ -372,7 +573,7 @@ async def _draft_raw(messages: list[dict], dl: Deadline) -> tuple[str, str, int,
     thinking 응답이 max_tokens 에 걸려 잘리면 thinking 없이 한 번 더 받는다.
     돌려주는 것: (초안, 답변 언어, 근거 개수=0, 근거 텍스트="")
     """
-    forwarded = _with_answer_instruction(messages)
+    forwarded = _with_answer_instruction(await _with_selective_frontier_evidence(messages))
     cap = answer_timeout(dl, ANSWER_CAP_S, ANSWER_FLOOR_S) if DEADLINE_GUARD else None
 
     # 남은 시간이 thinking 을 감당 못 하면 처음부터 켜지 않는다.
