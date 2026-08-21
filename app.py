@@ -21,6 +21,8 @@ from budget import Deadline
 from generation import generate
 from mcp_client import MCPClient
 from router import classify
+from submission.config import SERVER_MAX_TOKENS, resolve_api_key
+from submission.context import COUNTER, ContextBudget, fit_messages
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("driver")
@@ -34,11 +36,14 @@ log = logging.getLogger("driver")
 _FALLBACK_KEY = "lunit_dFthkHMh2_gB2aVIo_mi5jznWpHoXbU2a2Od4hlVtf4"
 
 FM_URL = os.environ.get("LUNIT_FM_API_URL", "https://model.hackathon.lunit.io").rstrip("/")
-FM_KEY = os.environ.get("LUNIT_FM_API_KEY", "").strip() or _FALLBACK_KEY
+# 키는 submission/config.py 한 곳에서 정한다. 두 진입점이 서로 다른 키를 들고 있으면
+# 한쪽만 폐기됐을 때 원인을 못 찾는다. 순서: 환경변수 → 현재 팀 키 → 이전 팀 키.
+FM_KEY = resolve_api_key() or _FALLBACK_KEY
 FM_MODEL = os.environ.get("LUNIT_FM_MODEL", "Lunit/L2-preview")
 
-# 서버가 max_tokens 2048 을 넘기면 400 (`output_limit_exceeded`) 을 던진다. 이건 상한이다.
-SERVER_MAX_TOKENS = 2048
+# 서버 실측 상한 (2026-08-22): max_tokens 32,769 부터 `output_limit_exceeded`.
+# 여기 박혀 있던 2048 은 사실이 아니었다 — 8,192 출력이 정상 완주하는 것을 확인했다.
+# 기본값은 2048 그대로 둔다. 올리는 것은 지연·thinking 정책과 함께 판단할 문제다.
 MAX_TOKENS = min(int(os.environ.get("FM_MAX_TOKENS", "2048")), SERVER_MAX_TOKENS)
 TIMEOUT = float(os.environ.get("FM_TIMEOUT", "120"))
 FM_RETRIES = int(os.environ.get("FM_RETRIES", "3"))
@@ -67,6 +72,11 @@ MCP_CONCURRENCY = int(os.environ.get("MCP_CONCURRENCY", "12"))
 #   thinking off → reasoning 0자    + content 576자, finish=stop     (완결, 395토큰)
 # 상한이 2048 로 묶여 있는 한, thinking 을 켜면 긴 답변은 구조적으로 완결될 수 없다.
 ENABLE_THINKING = os.environ.get("FM_THINKING", "0") == "1"
+
+# 입력 컨텍스트 예산. 이 값 하나로 대화를 얼마나 실을지가 정해진다.
+# 창을 넘긴 요청은 400 이거나 — 더 나쁘게는 — 앞부분이 조용히 잘린 채 통과한다.
+# 잘리는 건 대개 맨 앞이고, 멀티턴에서 맨 앞은 사용자가 처음 말한 증상·병력이다.
+INPUT_BUDGET = ContextBudget.from_env()
 
 # L2 follows task instructions in the latest user turn more reliably than a
 # separate system message. Keep this deliberately narrow: it prevents a generic
@@ -150,7 +160,15 @@ async def call_fm(
                     json=payload,
                 )
             if r.status_code == 200:
-                return r.json()
+                data = r.json()
+                # 서버가 실제 prompt_tokens 를 알려 준다. 토크나이저를 못 들고 가는 대신
+                # 매 호출마다 정답지를 한 장씩 받아 추정기를 실제 값으로 끌어당긴다.
+                usage = data.get("usage")
+                if isinstance(usage, dict) and isinstance(usage.get("prompt_tokens"), int):
+                    COUNTER.observe(
+                        COUNTER.estimate_messages(payload["messages"]), usage["prompt_tokens"]
+                    )
+                return data
 
             # 본문에 원인이 들어 있다 (예: {"error":{"code":"output_limit_exceeded"}}).
             # 상태코드만 남기면 당일 새벽에 원인을 못 찾는다.
@@ -176,6 +194,16 @@ async def generate_reply(messages: list[dict], dl: Deadline) -> str:
         content = forwarded[-1].get("content")
         if isinstance(content, str):
             forwarded[-1]["content"] = f"{content}\n\n[{ANSWER_INSTRUCTION}]"
+
+    # 예산 안으로 접는다. 오래된 턴부터 버리고 마지막 질문은 무조건 남긴다.
+    room = INPUT_BUDGET.total - INPUT_BUDGET.reserve
+    before = COUNTER.estimate_messages(forwarded)
+    if before > room:
+        forwarded, dropped = fit_messages(forwarded, room, COUNTER)
+        log.info(
+            "입력 예산 초과 — %d턴 생략 (%d→%d tok / 한도 %d)",
+            dropped, before, COUNTER.estimate_messages(forwarded), INPUT_BUDGET.total,
+        )
     data = await call_fm(
         forwarded,
         MAX_TOKENS,
@@ -215,7 +243,9 @@ async def chat_completions(body: dict) -> dict[str, Any]:
         # 한 번만 더, 짧게 답을 받아 본다. 늦은 답이 없는 답보다 낫다.
         log.error("요청 시간 초과 — 직답으로 되살린다 (elapsed=%.1fs)", dl.elapsed)
         try:
-            data = await asyncio.wait_for(call_fm(messages, MAX_TOKENS), timeout=60)
+            # 되살리기 경로도 예산을 지켜야 한다. 여기서 창을 넘기면 폴백까지 같이 죽는다.
+            revive, _ = fit_messages(messages, INPUT_BUDGET.total - INPUT_BUDGET.reserve, COUNTER)
+            data = await asyncio.wait_for(call_fm(revive, MAX_TOKENS), timeout=60)
             content = (data["choices"][0]["message"].get("content") or "").strip()
         except Exception:
             log.exception("직답 폴백도 실패")

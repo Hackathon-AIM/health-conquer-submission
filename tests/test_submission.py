@@ -7,7 +7,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from submission.config import Settings
+from submission.context import TokenCounter
 from submission.mcp import LunitMCPClient, _parse_sse
+from submission.toolspec import build_tools
 from submission.model import ChatResponse, LunitModelClient
 from submission.orchestrator import NativeDriver
 from submission.routing import clarification_question, detect_persona
@@ -171,9 +173,15 @@ class SubmissionTests(unittest.TestCase):
             {"name": "openapi_law_search"},
             {"name": "kcd_get_name"},
         ]
-        selected = NativeDriver._select_tool_definitions(definitions, "세툭시맙 약 부작용")
-        names = {tool["name"] for tool in selected}
-        self.assertEqual(names, {"adr_retrieve_drug_info", "rag_vector_query"})
+        tools, diagnostics = build_tools(
+            definitions, "세툭시맙 약 부작용", TokenCounter(), token_budget=400, max_tools=4,
+        )
+        names = {tool["function"]["name"] for tool in tools}
+        self.assertIn("adr_retrieve_drug_info", names)
+        # 법령·질병코드 도구는 이 질문과 무관하다. 좁은 창에서 이게 실리면 근거가 밀린다.
+        self.assertNotIn("openapi_law_search", names)
+        self.assertNotIn("kcd_get_name", names)
+        self.assertFalse(diagnostics.get("starved"))
 
     def test_emergency_short_circuits_model(self) -> None:
         model = ScriptedModel([])

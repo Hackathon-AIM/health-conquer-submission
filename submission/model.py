@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import random
 import time
 import urllib.error
@@ -11,6 +12,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from .config import Settings
+from .context import COUNTER, ContextBudget, fit_messages
+
+log = logging.getLogger("driver.model")
 
 
 class ModelError(RuntimeError):
@@ -41,6 +45,11 @@ class LunitModelClient:
     ) -> ChatResponse:
         if not self.settings.fm_api_key:
             raise ModelError("LUNIT_FM_API_KEY is not set")
+
+        # 마지막 방어선. 호출자가 이미 예산을 맞춰 보냈더라도, 창을 넘긴 요청이
+        # 여기를 통과하는 일은 없어야 한다. 잘림은 조용하고 그 대가는 0점이다.
+        messages, estimated = self._fit(messages, tools)
+
         payload: dict[str, Any] = {
             "model": self.settings.fm_model,
             "messages": messages,
@@ -53,6 +62,7 @@ class LunitModelClient:
             payload["tool_choice"] = tool_choice or "auto"
 
         data = self._post(payload)
+        self._calibrate(estimated, data)
         try:
             message = data["choices"][0]["message"]
         except (KeyError, IndexError, TypeError) as exc:
@@ -60,6 +70,38 @@ class LunitModelClient:
         if not isinstance(message, dict):
             raise ModelError("Model API message is not an object")
         return ChatResponse(message=message, raw=data)
+
+    def _fit(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        budget = ContextBudget.allocate(self.settings.max_input_tokens)
+        tool_tokens = COUNTER.estimate_tools(tools)
+        room = budget.total - budget.reserve - tool_tokens
+        estimated = COUNTER.estimate_request(messages, tools)
+        if estimated <= budget.total - budget.reserve:
+            return messages, estimated
+        fitted, dropped = fit_messages(messages, max(64, room), COUNTER)
+        estimated = COUNTER.estimate_request(fitted, tools)
+        log.warning(
+            "입력 예산 초과 — 마지막 방어선에서 %d블록 잘라냄 (%d→%d tok / 한도 %d, 툴 %d)",
+            dropped, COUNTER.estimate_request(messages, tools), estimated, budget.total, tool_tokens,
+        )
+        return fitted, estimated
+
+    @staticmethod
+    def _calibrate(estimated: int, data: dict[str, Any]) -> None:
+        """서버가 알려준 실제 prompt_tokens 로 추정기를 보정한다.
+
+        토크나이저를 못 들고 가는 대신, 매 호출마다 정답지를 한 장씩 받는 셈이다.
+        """
+        usage = data.get("usage")
+        if not isinstance(usage, dict):
+            return
+        actual = usage.get("prompt_tokens")
+        if isinstance(actual, int) and actual > 0:
+            COUNTER.observe(estimated, actual)
 
     def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
