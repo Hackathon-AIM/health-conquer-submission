@@ -1,0 +1,6 @@
+# A/B: 비평 패스가 실제로 점수를 올리는지 측정
+name: v1_no_critic
+retrieval:
+  mode: mock
+layers:
+  critic: false

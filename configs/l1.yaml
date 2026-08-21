@@ -1,0 +1,49 @@
+# L1-16B-A3B — 대회 의과학 FM 의 16B 형제.
+#
+# https://huggingface.co/learning-unit/L1-16B-A3B
+#   루닛 컨소시엄(트릴리온랩스·SK바이오팜·병원) · 과기부 특화 파운데이션 모델 사업
+#   Gravity-16B-A3B-Base 기반 SFT · 임상 전용 · Apache 2.0 · 한국어+영어
+#   16.24B 총 / 3B 활성 · 64 expert top-8 · 32,768 컨텍스트 · GLM-4.5 토크나이저
+#
+# ★ 이미 HealthBench-Consensus 93.50% 를 낸다.
+#   즉 우리 파이프라인의 임무는 "점수를 올리는 것"이 아니라
+#   "이 숫자를 깎지 않으면서 위험 케이스를 막는 것"에 가깝다.
+#   반드시 configs/l1_raw.yaml 과 비교할 것.
+#
+# ⚠️ <think>...</think> 로 추론한다. strip_think 를 절대 끄지 말 것.
+#
+# 서빙 (SGLang, 모델 카드 권장):
+#   python -m sglang.launch_server --model-path learning-unit/L1-16B-A3B \
+#     --port 9006 --host 0.0.0.0 --tp 1 --dtype bfloat16 --trust-remote-code \
+#     --attention-backend triton --moe-runner-backend triton
+#
+# 또는 vLLM:
+#   vllm serve learning-unit/L1-16B-A3B --port 9006 --trust-remote-code
+#
+# 메모리: bf16 기준 약 33GB (16.24B × 2). A100 40GB 1장이면 충분.
+#         MoE 는 활성 3B 라도 전문가 전체를 올려야 한다.
+
+name: l1_16b
+
+llm:
+  base_url: "http://localhost:9006/v1"
+  api_key_env: MEDAI_API_KEY
+  timeout: 60.0              # think 블록 때문에 생성이 길다
+  max_retries: 1
+  temperature: 0.2           # 모델 카드는 0.7 권장. 재현성 위해 낮췄다 → A/B 대상
+  max_tokens: 2048           # think 오버헤드. 모델 카드 권장 최소값
+  context_window: 32768
+  strip_think: true          # ★ 끄지 말 것
+
+models:
+  classifier: learning-unit/L1-16B-A3B
+  rewriter:   learning-unit/L1-16B-A3B
+  drafter:    learning-unit/L1-16B-A3B
+  critic:     learning-unit/L1-16B-A3B
+  extractor:  learning-unit/L1-16B-A3B
+  grader:     gpt-4.1        # 채점자는 CoEval 기본값에 맞춘다 (우리 챗봇 아님)
+
+retrieval:
+  mode: mock                 # 실제 RAG 엔드포인트가 열리면 live
+  context_token_budget: 3000 # 32K 컨텍스트라 8K 때보다 여유가 있다
+  reranker: none
