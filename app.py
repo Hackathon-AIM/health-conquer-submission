@@ -11,9 +11,6 @@
 import asyncio
 import logging
 import os
-import re
-import time
-import uuid
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -23,7 +20,7 @@ from fastapi import FastAPI
 from budget import Deadline
 from generation import generate
 from mcp_client import MCPClient
-from router import DOMAIN_TOOLS, Route, rule_date_sensitive
+from router import classify
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("driver")
@@ -39,17 +36,18 @@ _FALLBACK_KEY = "lunit_dFthkHMh2_gB2aVIo_mi5jznWpHoXbU2a2Od4hlVtf4"
 FM_URL = os.environ.get("LUNIT_FM_API_URL", "https://model.hackathon.lunit.io").rstrip("/")
 FM_KEY = os.environ.get("LUNIT_FM_API_KEY", "").strip() or _FALLBACK_KEY
 FM_MODEL = os.environ.get("LUNIT_FM_MODEL", "Lunit/L2-preview")
-PUBLIC_MODEL = os.environ.get("HARNESS_MODEL_NAME", "medai")
 
 # 서버가 max_tokens 2048 을 넘기면 400 (`output_limit_exceeded`) 을 던진다. 이건 상한이다.
-SERVER_MAX_TOKENS = 2048
-MAX_TOKENS = min(int(os.environ.get("FM_MAX_TOKENS", "2048")), SERVER_MAX_TOKENS)
-DIRECT_MAX_TOKENS = min(int(os.environ.get("FM_DIRECT_MAX_TOKENS", "1100")), SERVER_MAX_TOKENS)
-MCP_FINAL_MAX_TOKENS = min(int(os.environ.get("FM_MCP_FINAL_MAX_TOKENS", "900")), SERVER_MAX_TOKENS)
+# 서버 상한은 2048 이 아니라 32768 이다 (ziuuu 실측: 32768→200,
+# 32769→400 "max_tokens exceeds 32768"). 2048 은 낡은 관측이었다.
+SERVER_MAX_TOKENS = 32768
+# 4096 근거 (ziuuu, 같은 질문 6개 A/B): 2048 → 폴백 1/6 · 40.0s · 1,371자,
+# 4096 → 폴백 0/6 · 39.3s · 1,743자. 폴백이 사라지는데 지연은 같다.
+# 6144 는 근거 없이 고른 값이었고 로컬 12문항에서 중앙 지연이 24.0→32.4초로 올랐다.
+MAX_TOKENS = min(int(os.environ.get("FM_MAX_TOKENS", "4096")), SERVER_MAX_TOKENS)
 TIMEOUT = float(os.environ.get("FM_TIMEOUT", "120"))
 FM_RETRIES = int(os.environ.get("FM_RETRIES", "3"))
 FM_BACKOFF = float(os.environ.get("FM_BACKOFF", "1.5"))
-MCP_ENABLED = os.environ.get("MCP_ENABLED", "0") == "1"
 
 # retrieval 단계에서 허용할 MCP 도구 호출 수. 대시보드 팁이 "제한하라"고 명시한다.
 RETRIEVAL_BUDGET = int(os.environ.get("RETRIEVAL_BUDGET", "3"))
@@ -79,58 +77,13 @@ ENABLE_THINKING = os.environ.get("FM_THINKING", "0") == "1"
 # separate system message. Keep this deliberately narrow: it prevents a generic
 # referral from replacing an otherwise answerable medical response.
 ANSWER_INSTRUCTION = (
-    "Use the full conversation context and answer the latest question directly in the user's language. "
-    "Silently check the key medical reasoning, missing assumptions, and any relevant red flags before "
-    "writing, but do not reveal hidden reasoning. Give a complete practical answer: what is most likely "
-    "or recommended, why, what to do next, and when urgent care or clinician review is specifically "
-    "needed. Keep the final answer concise, usually 4-7 sentences in one or two short paragraphs. "
-    "Avoid headings and long lists unless the user explicitly asks for them. Avoid a referral-only answer."
-)
-
-_EVIDENCE_RE = re.compile(
-    r"(근거|출처|인용|논문|연구|가이드라인|지침|공식|문헌|reference|citation|"
-    r"evidence|guideline|study|paper|trial|peer[- ]reviewed|systematic\s+review|"
-    r"meta[- ]analysis|official\s+(?:source|label|document|guidance))",
-    re.I,
-)
-_CLAIM_CHECK_RE = re.compile(
-    r"(진짜|사실|맞아|검증|입증|효과\s*있|몇\s*%|퍼센트|확률|위험도|증가한다던데|"
-    r"is\s+it\s+true|is\s+there\s+(?:research|evidence)|proven|what\s+percent|"
-    r"does\s+.+\s+(?:increase|decrease|raise|lower)\s+(?:the\s+)?(?:risk|odds|rate))",
-    re.I,
-)
-_POLICY_RE = re.compile(
-    r"(급여|비급여|보험|심평원|HIRA|고시|수가|청구|산정|약가|상한금액|본인부담|"
-    r"\breimbursement\b|\bcoverage\b|\bbilling\b|\bbillable\b|\bfee\b|\bprice\b|"
-    r"\bcovered\b|not\s+covered|\bcopay\b|out[- ]of[- ]pocket)",
-    re.I,
-)
-_LAW_RE = re.compile(
-    r"(법령|법률|조문|시행령|시행규칙|고시\s*제|law|statute|regulation|legal\s+duty|article)",
-    re.I,
-)
-_KCD_RE = re.compile(
-    r"(KCD|ICD|질병코드|상병코드|진단코드|disease\s*code|diagnosis\s*code|"
-    r"diagnostic\s*code|classification\s*code)",
-    re.I,
-)
-_MED_DETAIL_RE = re.compile(
-    r"(허가|적응증|금기|병용|상호작용|이상반응|부작용|용량|투여|임신\s*중|수유\s*중|"
-    r"label|indication|contraindicat(?:ion|ed)|interaction|adverse|side\s*effect|dose|dosage|"
-    r"pregnancy|lactation|breastfeeding|take\s+.+\s+with|safe\s+with|combine|combined\s+with|"
-    r"use\s+.+\s+together)",
-    re.I,
-)
-_MED_CAUSALITY_RE = re.compile(
-    r"(부작용|이상반응|때문|탓|원인|caus|adverse|side\s*effect)", re.I
-)
-_SPECIFIC_DRUG_RE = re.compile(
-    r"(아세트아미노펜|타이레놀|이부프로펜|부루펜|아스피린|와파린|메트포르민|"
-    r"암로디핀|로사르탄|리시노프릴|세툭시맙|오메프라졸|아토르바스타틴|"
-    r"acetaminophen|paracetamol|ibuprofen|aspirin|warfarin|metformin|amlodipine|"
-    r"losartan|lisinopril|cetuximab|omeprazole|atorvastatin|"
-    r"[가-힣]{2,}(?:맙|닙|틴|신|핀|탄|롤|졸|딘|펜|센|민|린|론|손|탁|실|스타틴))",
-    re.I,
+    "Do not substitute 'consult a professional' for an answer; answer as far as you can. "
+    "Address every element the user raised, including each sub-question, and include the "
+    "warning signs that would mean they should seek care promptly."
+    "Write in plain prose without headings or bullet lists. Make it dense rather than long: "
+    "cover more of what they asked in fewer words."
+    "Do not invent guideline names, organisations, or dates. If no specific guidance exists "
+    "for their situation, say that plainly instead of naming one."
 )
 
 _fm_sem = asyncio.Semaphore(FM_CONCURRENCY)
@@ -154,16 +107,8 @@ async def lifespan(_: FastAPI):
     if not FM_KEY:
         log.error("LUNIT_FM_API_KEY 가 비어 있다. 모든 생성 요청이 실패한다.")
     log.info(
-        "driver up — model=%s max_tokens=%d direct_tokens=%d mcp_final_tokens=%d mcp=%s thinking=%s budget=%.0fs fm_conc=%d mcp_conc=%d",
-        FM_MODEL,
-        MAX_TOKENS,
-        DIRECT_MAX_TOKENS,
-        MCP_FINAL_MAX_TOKENS,
-        MCP_ENABLED,
-        ENABLE_THINKING,
-        REQUEST_BUDGET_S,
-        FM_CONCURRENCY,
-        MCP_CONCURRENCY,
+        "driver up — model=%s max_tokens=%d thinking=%s budget=%.0fs fm_conc=%d mcp_conc=%d",
+        FM_MODEL, MAX_TOKENS, ENABLE_THINKING, REQUEST_BUDGET_S, FM_CONCURRENCY, MCP_CONCURRENCY,
     )
     try:
         yield
@@ -182,171 +127,11 @@ async def health() -> dict[str, Any]:
 
 @app.get("/v1/models")
 async def list_models() -> dict[str, Any]:
-    models = [
-        {"id": PUBLIC_MODEL, "object": "model", "created": 0, "owned_by": "team"},
-    ]
-    if FM_MODEL != PUBLIC_MODEL:
-        models.append({"id": FM_MODEL, "object": "model", "created": 0, "owned_by": "lunit"})
-    return {"object": "list", "data": models}
+    return {"object": "list", "data": [{"id": FM_MODEL, "object": "model", "owned_by": "lunit"}]}
 
 
 # 일시적인 것들. 실측으로 502(nginx)를 봤다 — 재시도 없이 두면 그 문항이 통째로 0점이다.
 RETRY_STATUS = {429, 500, 502, 503, 504}
-
-
-def _messages_with_answer_instruction(messages: list[dict]) -> list[dict]:
-    """마지막 user 턴에만 좁은 답변 지시를 붙인다."""
-    forwarded = [dict(message) for message in messages]
-    for message in reversed(forwarded):
-        if message.get("role") != "user":
-            continue
-        content = message.get("content")
-        if isinstance(content, str):
-            message["content"] = f"{content}\n\n[{ANSWER_INSTRUCTION}]"
-        elif isinstance(content, list):
-            message["content"] = [
-                *content,
-                {"type": "text", "text": f"[{ANSWER_INSTRUCTION}]"},
-            ]
-        break
-    return forwarded
-
-
-def _content_text(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict) and item.get("type") == "text":
-                parts.append(str(item.get("text") or ""))
-        return "\n".join(part for part in parts if part)
-    return "" if content is None else str(content)
-
-
-def _last_user_text(messages: list[dict]) -> str:
-    for message in reversed(messages):
-        if message.get("role") == "user":
-            return _content_text(message.get("content"))
-    return ""
-
-
-def _recent_user_text(messages: list[dict], turns: int = 3) -> str:
-    user_turns = [
-        _content_text(message.get("content"))
-        for message in messages
-        if message.get("role") == "user"
-    ]
-    return "\n".join(text for text in user_turns[-turns:] if text)
-
-
-def _language_for(text: str) -> str:
-    return "ko" if re.search(r"[가-힣]", text) else "en"
-
-
-def _mcp_route(messages: list[dict]) -> Route | None:
-    """확실한 외부 근거 질문만 MCP로 보낸다. 애매하면 L2 direct가 기본이다."""
-    text = _recent_user_text(messages)
-    if not text.strip():
-        return None
-
-    domain = ""
-    if _KCD_RE.search(text):
-        domain = "kcd"
-    elif _LAW_RE.search(text):
-        domain = "korean_law"
-    elif _POLICY_RE.search(text):
-        domain = "hira_drug_price" if re.search(r"(약가|상한금액|price)", text, re.I) else "hira_updates"
-    elif _MED_DETAIL_RE.search(text) and _SPECIFIC_DRUG_RE.search(text):
-        domain = "adr" if _MED_CAUSALITY_RE.search(text) else "mfds"
-    elif re.search(r"(가이드라인|지침|권고|guideline)", text, re.I):
-        domain = "guideline_index"
-    elif _CLAIM_CHECK_RE.search(text) or _EVIDENCE_RE.search(text):
-        domain = "pubmed"
-
-    if not domain:
-        return None
-
-    tools = list(DOMAIN_TOOLS.get(domain) or [])
-    if not tools:
-        return None
-    date_sensitive = rule_date_sensitive(text)
-    if date_sensitive and domain not in ("korean_law", "guideline_index") and "hira_updates_search" not in tools:
-        tools.append("hira_updates_search")
-    return Route(
-        domain=domain,
-        urgency="routine",
-        context="sufficient",
-        persona="layperson",
-        lang=_language_for(_last_user_text(messages) or text),
-        ask_back="",
-        date_sensitive=date_sensitive,
-        search_query=text,
-        tools=tools,
-        source="rules",
-    )
-
-
-def _choice(data: dict[str, Any]) -> dict[str, Any]:
-    return data["choices"][0]
-
-
-def _choice_content(data: dict[str, Any]) -> str:
-    return (_choice(data)["message"].get("content") or "").strip()
-
-
-def _last_resort_answer(messages: list[dict]) -> str:
-    last_user = _last_user_text(messages)
-    if any("가" <= char <= "힣" for char in last_user):
-        return (
-            "현재 답변 생성이 원활하지 않아 질문에 맞춘 충분한 답을 드리지 못했습니다. "
-            "증상이 심하거나 빠르게 악화하거나, 호흡곤란·의식저하·심한 흉통·마비·대량 출혈 같은 "
-            "응급 신호가 있으면 119 또는 응급실 도움을 받으세요."
-        )
-    return (
-        "I could not generate a reliable answer for this request. If symptoms are severe, rapidly "
-        "worsening, or include trouble breathing, confusion, severe chest pain, weakness on one side, "
-        "or heavy bleeding, seek emergency care now."
-    )
-
-
-async def answer_with_optional_mcp(messages: list[dict], dl: Deadline) -> str:
-    if not MCP_ENABLED:
-        return await generate_reply(messages, dl)
-
-    route = _mcp_route(messages)
-    if route is None:
-        return await generate_reply(messages, dl)
-
-    if dl.expired(reserve=ANSWER_RESERVE_S):
-        log.info("MCP gate hit but time budget is too low — using direct L2")
-        return await generate_reply(messages, dl)
-
-    try:
-        log.info("MCP gate hit — domain=%s tools=%s", route.domain, ",".join(route.tools))
-        content, result = await generate(
-            _messages_with_answer_instruction(messages),
-            route,
-            call_fm,
-            MCP,
-            MCP_FINAL_MAX_TOKENS,
-            budget=RETRIEVAL_BUDGET,
-            deadline=dl,
-            reserve=ANSWER_RESERVE_S,
-        )
-        if content:
-            return content
-        log.warning(
-            "MCP path returned empty content — using direct L2 (domain=%s status=%s)",
-            route.domain,
-            getattr(result, "status", None),
-        )
-    except Exception as e:  # noqa: BLE001 — MCP 경로 실패가 최종 빈 답변이 되면 안 된다.
-        log.warning("MCP path failed — using direct L2 (%s: %s)", type(e).__name__, str(e)[:200])
-
-    return await generate_reply(messages, dl)
 
 
 async def call_fm(
@@ -395,33 +180,30 @@ async def call_fm(
     raise last
 
 
-async def generate_reply(messages: list[dict], dl: Deadline) -> str:
-    """Use a completed thinking response, otherwise fall back to the 43-point path."""
-    forwarded = _messages_with_answer_instruction(messages)
-    try:
-        data = await call_fm(
-            forwarded,
-            DIRECT_MAX_TOKENS,
-            {"chat_template_kwargs": {"enable_thinking": True}},
-        )
-    except Exception as e:  # noqa: BLE001 - 실패한 thinking 호출보다 완성 답변이 중요하다.
-        log.warning(
-            "thinking 호출 실패 — 기존 경로로 폴백 (%s elapsed=%.1fs)",
-            type(e).__name__,
-            dl.elapsed,
-        )
-        data = await call_fm(
-            forwarded,
-            DIRECT_MAX_TOKENS,
-            {"chat_template_kwargs": {"enable_thinking": False}},
-        )
-        content = _choice_content(data)
-        if not content:
-            log.error("L2 raw 응답의 content가 비었다 — elapsed=%.1fs", dl.elapsed)
-        return content
+def prepare_messages(messages: list[dict]) -> list[dict]:
+    """Attach ANSWER_INSTRUCTION to the latest user turn.
 
-    choice = _choice(data)
-    content = _choice_content(data)
+    Returns a new list; the caller's message objects are never mutated. Every
+    generation path — including the outer timeout fallback — must send these
+    prepared messages, or that request silently loses the instruction.
+    """
+    prepared = [dict(message) for message in messages]
+    if prepared and prepared[-1].get("role") == "user":
+        content = prepared[-1].get("content")
+        if isinstance(content, str):
+            prepared[-1]["content"] = f"{content}\n\n[{ANSWER_INSTRUCTION}]"
+    return prepared
+
+
+async def generate_reply(forwarded: list[dict], dl: Deadline) -> str:
+    """Use a completed thinking response, otherwise fall back to the 43-point path."""
+    data = await call_fm(
+        forwarded,
+        MAX_TOKENS,
+        {"chat_template_kwargs": {"enable_thinking": True}},
+    )
+    choice = data["choices"][0]
+    content = (choice["message"].get("content") or "").strip()
     if choice.get("finish_reason") == "length" or not content:
         log.info(
             "thinking 응답 손상 — 기존 경로로 폴백 (finish=%s content=%d elapsed=%.1fs)",
@@ -431,10 +213,10 @@ async def generate_reply(messages: list[dict], dl: Deadline) -> str:
         )
         data = await call_fm(
             forwarded,
-            DIRECT_MAX_TOKENS,
+            MAX_TOKENS,
             {"chat_template_kwargs": {"enable_thinking": False}},
         )
-        content = _choice_content(data)
+        content = (data["choices"][0]["message"].get("content") or "").strip()
     if not content:
         log.error("L2 raw 응답의 content가 비었다 — elapsed=%.1fs", dl.elapsed)
     return content
@@ -443,46 +225,33 @@ async def generate_reply(messages: list[dict], dl: Deadline) -> str:
 @app.post("/v1/chat/completions")
 async def chat_completions(body: dict) -> dict[str, Any]:
     messages = body.get("messages") or []
+    forwarded = prepare_messages(messages)
     dl = Deadline.start(REQUEST_BUDGET_S)
     try:
         # 단계마다 남은 시간을 보며 스스로 줄이지만, 그래도 넘기면 여기서 끊는다.
         content = await asyncio.wait_for(
-            answer_with_optional_mcp(messages, dl), timeout=REQUEST_BUDGET_S + 20
+            generate_reply(forwarded, dl), timeout=REQUEST_BUDGET_S + 20
         )
     except asyncio.TimeoutError:
         # 여기서 빈 문자열을 흘리면 그 문항은 0점이다. 도구도 라우팅도 없이
         # 한 번만 더, 짧게 답을 받아 본다. 늦은 답이 없는 답보다 낫다.
         log.error("요청 시간 초과 — 직답으로 되살린다 (elapsed=%.1fs)", dl.elapsed)
         try:
-            data = await asyncio.wait_for(
-                call_fm(
-                    _messages_with_answer_instruction(messages),
-                    DIRECT_MAX_TOKENS,
-                    {"chat_template_kwargs": {"enable_thinking": False}},
-                ),
-                timeout=60,
-            )
-            content = _choice_content(data)
+            data = await asyncio.wait_for(call_fm(forwarded, MAX_TOKENS), timeout=60)
+            content = (data["choices"][0]["message"].get("content") or "").strip()
         except Exception:
             log.exception("직답 폴백도 실패")
-            content = _last_resort_answer(messages)
+            content = ""
     except Exception:
         # 평가 하네스에 5xx 를 돌려주면 대화 전체가 깨질 수 있다.
         # 그래서 형식은 지키되, 실패는 로그에 남겨 사후에 반드시 보이게 한다.
         log.exception("생성 실패")
-        content = _last_resort_answer(messages)
-
-    if not content:
-        content = _last_resort_answer(messages)
+        content = ""
 
     log.info("응답 %d자 / %.1fs", len(content), dl.elapsed)
-    prompt_chars = sum(len(_content_text(message.get("content"))) for message in messages)
-    completion_chars = len(content)
     return {
-        "id": "chatcmpl-" + uuid.uuid4().hex[:24],
         "object": "chat.completion",
-        "created": int(time.time()),
-        "model": body.get("model") or PUBLIC_MODEL,
+        "model": FM_MODEL,
         "choices": [
             {
                 "index": 0,
@@ -490,9 +259,4 @@ async def chat_completions(body: dict) -> dict[str, Any]:
                 "finish_reason": "stop",
             }
         ],
-        "usage": {
-            "prompt_tokens": max(1, int(prompt_chars * 0.7)),
-            "completion_tokens": max(1, int(completion_chars * 0.7)),
-            "total_tokens": max(2, int((prompt_chars + completion_chars) * 0.7)),
-        },
     }
