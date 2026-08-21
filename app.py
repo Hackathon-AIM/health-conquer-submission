@@ -30,6 +30,7 @@ from generation import generate
 from mcp_client import MCPClient
 from review import REVIEW_MODE, review
 from router import classify
+from telemetry import TELEMETRY, staged
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("driver")
@@ -206,6 +207,19 @@ async def health() -> dict[str, Any]:
     return {"status": "ok", "model": FM_MODEL, "key_present": bool(FM_KEY)}
 
 
+@app.get("/metrics")
+async def metrics() -> dict[str, Any]:
+    """이번 프로세스가 지금까지 태운 토큰. 회차가 끝난 뒤 한 번 긁으면 된다.
+
+    로그를 grep 하지 않고도 "이번 회차에 몇 건이 잘렸고 몇 건이 빈 답이었는가" 를
+    바로 볼 수 있다. 그 둘이 점수에 직접 닿는 숫자다.
+
+    평가자는 /v1/* 만 프록시하므로 이 경로는 우리 쪽에서만 보인다 — 즉 이걸
+    노출한다고 채점에 영향이 가지 않는다.
+    """
+    return TELEMETRY.snapshot()
+
+
 @app.get("/v1/models")
 async def list_models() -> dict[str, Any]:
     return {"object": "list", "data": [{"id": FM_MODEL, "object": "model", "owned_by": "lunit"}]}
@@ -220,6 +234,7 @@ async def call_fm(
     max_tokens: int,
     extra: dict[str, Any] | None = None,
     timeout: float | None = None,
+    stage: str = "fm",
 ) -> dict[str, Any]:
     """FM 한 번 호출. `extra` 로 response_format 같은 vLLM 파라미터를 얹는다.
 
@@ -265,7 +280,15 @@ async def call_fm(
                     timeout=min(TIMEOUT, left),
                 )
             if r.status_code == 200:
-                return r.json()
+                data = r.json()
+                # 서버가 이미 알려준 것을 주워 담는다. 동작은 바꾸지 않는다.
+                TELEMETRY.record(
+                    stage,
+                    data,
+                    requested_max_tokens=payload["max_tokens"],
+                    seconds=time.monotonic() - started,
+                )
+                return data
 
             # 본문에 원인이 들어 있다 (예: {"error":{"code":"output_limit_exceeded"}}).
             # 상태코드만 남기면 당일 새벽에 원인을 못 찾는다.
@@ -321,6 +344,7 @@ async def _direct_answer(
         max_tokens or MAX_TOKENS,
         {"chat_template_kwargs": {"enable_thinking": False}},
         timeout=t,
+        stage="direct",
     )
     return (data["choices"][0]["message"].get("content") or "").strip()
 
@@ -369,6 +393,7 @@ async def _draft_raw(messages: list[dict], dl: Deadline) -> tuple[str, str, int,
             MAX_TOKENS,
             {"chat_template_kwargs": {"enable_thinking": False}},
             timeout=cap,
+            stage="draft_nothink",
         )
         content = (data["choices"][0]["message"].get("content") or "").strip()
         return content, _lang_of(_last_user_text(messages)), 0, ""
@@ -379,6 +404,7 @@ async def _draft_raw(messages: list[dict], dl: Deadline) -> tuple[str, str, int,
             MAX_TOKENS,
             {"chat_template_kwargs": {"enable_thinking": True}},
             timeout=cap,
+            stage="draft_thinking",
         )
     except Exception as e:  # noqa: BLE001
         # thinking 호출이 시간에 걸렸다. 예외를 올리면 요청 전체가 구조 경로로
@@ -404,7 +430,8 @@ async def _draft_raw(messages: list[dict], dl: Deadline) -> tuple[str, str, int,
         )
         cap = answer_timeout(dl, ANSWER_CAP_S, ANSWER_FLOOR_S) if DEADLINE_GUARD else None
         data = await call_fm(
-            forwarded, MAX_TOKENS, {"chat_template_kwargs": {"enable_thinking": False}}, timeout=cap
+            forwarded, MAX_TOKENS, {"chat_template_kwargs": {"enable_thinking": False}},
+            timeout=cap, stage="draft_fallback",
         )
         content = (data["choices"][0]["message"].get("content") or "").strip()
     return content, _lang_of(_last_user_text(messages)), 0, ""
@@ -424,7 +451,10 @@ async def _draft_harness(messages: list[dict], dl: Deadline) -> tuple[str, str, 
 
     route = await classify(
         messages,
-        _timed(call_fm, call_cap(dl, CLASSIFY_CAP_S, reserve=keep) if DEADLINE_GUARD else None),
+        staged(
+            _timed(call_fm, call_cap(dl, CLASSIFY_CAP_S, reserve=keep) if DEADLINE_GUARD else None),
+            "classify",
+        ),
     )
     log.info(
         "route: domain=%s urgency=%s persona=%s lang=%s date=%s src=%s tools=%d",
@@ -445,7 +475,7 @@ async def _draft_harness(messages: list[dict], dl: Deadline) -> tuple[str, str, 
     content, retr = await generate(
         _with_answer_instruction(messages),
         route,
-        call_fm,
+        staged(call_fm, "harness"),
         MCP,
         MAX_TOKENS,
         budget,
@@ -477,7 +507,7 @@ async def generate_reply(messages: list[dict], dl: Deadline) -> str:
     reviewed, notes = await review(
         content,
         _last_user_text(messages),
-        call_fm,
+        staged(call_fm, "review"),
         lang=lang,
         deadline=dl if DEADLINE_GUARD else None,
         n_evidence=n_evidence,
