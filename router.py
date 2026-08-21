@@ -226,6 +226,20 @@ Return ONLY a JSON object, no prose, with these keys:
 Conversation (most recent user turn last):
 {question}"""
 
+# 영문 HealthBench에서는 "Korean health question"과 한국어 되묻기 지시가 분류 자체를
+# 흔든다. 원본은 default-off A/B의 기준점이므로 복제하지 않고 두 지시만 바꾼다.
+LANGUAGE_AWARE_CLASSIFY_PROMPT = (
+    CLASSIFY_PROMPT
+    .replace(
+        "You classify a Korean health question",
+        "You classify a health conversation written in Korean or English",
+    )
+    .replace(
+        '"ask_back": if context is "missing_critical", the single highest-value question to ask, in Korean,',
+        '"ask_back": if context is "missing_critical", the single highest-value question to ask, in the language of the last user message,',
+    )
+)
+
 
 def _extract_json(text: str) -> dict[str, Any] | None:
     text = (text or "").strip()
@@ -254,6 +268,31 @@ def transcript(messages: list[dict], turns: int = 5, per_turn: int = 700) -> str
         who = "User" if m.get("role") == "user" else "Assistant"
         lines.append(f"{who}: {str(m.get('content') or '')[:per_turn]}")
     return "\n".join(lines)
+
+
+_GUIDELINE_FALLBACK = re.compile(
+    r"\b(?:clinical\s+)?guidelines?\b|\brecommendation strength\b|\bevidence level\b|진료지침|권고등급",
+    re.I,
+)
+
+
+def _fallback_language(question: str) -> str:
+    """모델 분류가 멈춰도 질문에 쓰인 언어는 보존한다.
+
+    이 경로는 상류 5xx 뒤에만 쓰는 최소 폴백이다. 혼합 언어의 한국어 질문은
+    한국어로 두고, 한글 없이 라틴 문자가 있으면 영어로 답하게 한다.
+    """
+    if re.search(r"[가-힣]", question):
+        return "ko"
+    return "en" if re.search(r"[A-Za-z]", question) else "ko"
+
+
+def fallback_route(question: str) -> Route:
+    """분류 호출 실패 시, 높은 확신도의 지침 질문만 검색 경로를 살린다."""
+    raw: dict[str, Any] = {"lang": _fallback_language(question)}
+    if _GUIDELINE_FALLBACK.search(question):
+        raw["domain"] = "guideline_index"
+    return build_route(raw, question, source="fallback")
 
 
 def build_route(raw: dict[str, Any] | None, question: str, source: str) -> Route:
@@ -302,7 +341,13 @@ def build_route(raw: dict[str, Any] | None, question: str, source: str) -> Route
     return r
 
 
-async def classify(messages: list[dict], call_fm) -> Route:
+async def classify(
+    messages: list[dict],
+    call_fm,
+    *,
+    fallback_rules: bool = False,
+    language_aware: bool = False,
+) -> Route:
     """call_fm(messages, max_tokens, extra) -> OpenAI 응답 dict 를 주입받아 분류한다.
 
     주입식으로 둔 건 app.py 의 FM 호출과 중복 구현을 피하고, 테스트에서
@@ -313,8 +358,9 @@ async def classify(messages: list[dict], call_fm) -> Route:
         return Route(source="fallback", tools=[])
 
     try:
+        prompt = LANGUAGE_AWARE_CLASSIFY_PROMPT if language_aware else CLASSIFY_PROMPT
         data = await call_fm(
-            [{"role": "user", "content": CLASSIFY_PROMPT.format(question=transcript(messages))}],
+            [{"role": "user", "content": prompt.format(question=transcript(messages))}],
             512,
             {"response_format": ROUTE_RESPONSE_FORMAT},
         )
@@ -329,7 +375,13 @@ async def classify(messages: list[dict], call_fm) -> Route:
 
     if parsed is None:
         # 분류가 실패해도 응급 규칙만은 살려서 내려보낸다.
+        if fallback_rules:
+            return fallback_route(question)
         r = Route(source="fallback")
+        # 실험 경로만 분류 실패에도 마지막 사용자 발화의 답변 언어를 보존한다.
+        # 도메인 규칙은 별도 A/B 스위치가 맡으므로 여기서 넓히지 않는다.
+        if language_aware:
+            r.lang = _fallback_language(question)
         if rule_urgency(question) == "emergency":
             r.urgency = "emergency"
         r.tools = []

@@ -66,18 +66,74 @@ How to answer:
 - Answer in {lang_name}.
 {extra}"""
 
+LANGUAGE_AWARE_BASE_SYSTEM = """You are a medical assistant answering a real person's question.
+
+{persona}
+
+{urgency}
+
+How to answer:
+- Accuracy first. Cite as [1], [2] ONLY items that were actually handed to you as numbered
+  evidence. Never write a bracketed citation from memory, and never claim you "searched" or
+  "checked the guideline" when you did not — an unsupported citation is worse than none.
+- If the evidence is thin or absent, say plainly what is known, what the evidence did not settle,
+  and answer from general knowledge clearly marked as such. Never invent a guideline, article
+  number, price, or code.
+- Be complete enough to be useful, then stop. Length is not a virtue here; a tight answer beats a
+  long one. Do not restate the question or add filler openers.
+- Match the complexity and format requested by the user. For a straightforward request, give a
+  straightforward answer; do not add an unnecessary analysis, differential, or extra sections.
+- Answer in {lang_name}.
+{extra}"""
+
+_ENGLISH_LAYPERSON = (
+    "The reader is a member of the public. Use plain English, expand any term you must use, "
+    "and lead with what they should actually do."
+)
+
+_ENGLISH_EMERGENCY = (
+    "RED FLAGS ARE PRESENT. Open by telling them to contact local emergency services now or go "
+    "to the nearest emergency department, state the specific signs that make this urgent, and "
+    "what to do meanwhile. Do NOT ask follow-up questions. Keep it short and unambiguous."
+)
+
 DATE_NOTE = """- The question is pinned to a specific date. The sources you can read are CURRENT text
   only. If a rule took effect after the date in question, say explicitly that it is not the rule
   that applied then, rather than answering as if it were."""
 
 
-def generation_system(route: Any) -> str:
-    return BASE_SYSTEM.format(
-        persona=_PERSONA.get(route.persona, _PERSONA["layperson"]),
-        urgency=_URGENCY.get(route.urgency, _URGENCY["routine"]),
+def generation_system(route: Any, *, language_aware: bool = False) -> str:
+    if not language_aware:
+        return BASE_SYSTEM.format(
+            persona=_PERSONA.get(route.persona, _PERSONA["layperson"]),
+            urgency=_URGENCY.get(route.urgency, _URGENCY["routine"]),
+            lang_name="Korean" if route.lang == "ko" else "English",
+            extra=DATE_NOTE if route.date_sensitive else "",
+        )
+
+    persona = _PERSONA.get(route.persona, _PERSONA["layperson"])
+    if route.lang == "en" and route.persona == "layperson":
+        persona = _ENGLISH_LAYPERSON
+
+    urgency = _URGENCY.get(route.urgency, _URGENCY["routine"])
+    if route.lang == "en" and route.urgency == "emergency":
+        urgency = _ENGLISH_EMERGENCY
+
+    return LANGUAGE_AWARE_BASE_SYSTEM.format(
+        persona=persona,
+        urgency=urgency,
         lang_name="Korean" if route.lang == "ko" else "English",
         extra=DATE_NOTE if route.date_sensitive else "",
     )
+
+
+def direct_answer_messages(
+    messages: list[dict], route: Any, *, language_aware: bool = False
+) -> list[dict]:
+    """빈 응답·시간초과 복구도 정상 생성과 같은 언어 지시를 쓴다."""
+    if not language_aware:
+        return messages
+    return [{"role": "system", "content": generation_system(route, language_aware=True)}, *messages]
 
 
 async def generate(
@@ -89,9 +145,13 @@ async def generate(
     budget: int = 6,
     deadline=None,
     reserve: float = 25.0,
+    *,
+    language_aware: bool = False,
 ) -> tuple[str, RetrievalResult | None]:
     """generation 단계를 돌린다. 모델이 도구를 부르면 그 안에서 retrieval 을 실행한다."""
-    convo: list[dict] = [{"role": "system", "content": generation_system(route)}]
+    convo: list[dict] = [
+        {"role": "system", "content": generation_system(route, language_aware=language_aware)}
+    ]
     convo.extend(messages)
 
     # 검색할 게 없는 도메인(generic)이면 그대로 답한다.

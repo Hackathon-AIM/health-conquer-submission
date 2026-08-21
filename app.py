@@ -18,9 +18,9 @@ import httpx
 from fastapi import FastAPI
 
 from budget import Deadline
-from generation import generate
+from generation import direct_answer_messages, generate
 from mcp_client import MCPClient
-from router import classify
+from router import classify, fallback_route
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("driver")
@@ -43,10 +43,19 @@ MAX_TOKENS = min(int(os.environ.get("FM_MAX_TOKENS", "2048")), SERVER_MAX_TOKENS
 TIMEOUT = float(os.environ.get("FM_TIMEOUT", "120"))
 FM_RETRIES = int(os.environ.get("FM_RETRIES", "3"))
 FM_BACKOFF = float(os.environ.get("FM_BACKOFF", "1.5"))
+# 같은 입력에서 불필요한 응답 흔들림을 줄이기 위해 0을 기본으로 둔다. 재현성 A/B에서
+# 5문항 점수를 유지하면서 지연이 줄어든 것을 확인했고, 필요하면 환경변수로만 바꾼다.
+FM_TEMPERATURE = float(os.environ.get("FM_TEMPERATURE", "0"))
 
 # retrieval 단계에서 허용할 MCP 도구 호출 수. 대시보드 팁이 "제한하라"고 명시한다.
 RETRIEVAL_BUDGET = int(os.environ.get("RETRIEVAL_BUDGET", "3"))
 EMERGENCY_BUDGET = int(os.environ.get("EMERGENCY_BUDGET", "2"))
+# 라우터가 5xx 재시도 뒤에도 죽었을 때, 명시적 지침 질문만 보수적으로 검색 경로에
+# 남기는 A/B 스위치다. 기본은 기존 generic 폴백을 보존한다.
+FALLBACK_RULE_ROUTING = os.environ.get("FALLBACK_RULE_ROUTING", "0") == "1"
+# 영어·한국어 입력을 각각 같은 언어로 답하게 하는 프롬프트 A/B다. 기본은 기존
+# 제출 프롬프트라, 점수 상승이 확인되기 전에는 동작을 바꾸지 않는다.
+LANGUAGE_AWARE_PROMPT = os.environ.get("LANGUAGE_AWARE_PROMPT", "0") == "1"
 
 # 요청 하나에 쓸 수 있는 총 시간. RESERVE 는 최종 답변 생성 몫으로 떼어 둔다.
 #
@@ -131,6 +140,8 @@ async def call_fm(
         "chat_template_kwargs": {"enable_thinking": ENABLE_THINKING},
         **(extra or {}),
     }
+    if FM_TEMPERATURE is not None:
+        payload["temperature"] = FM_TEMPERATURE
     assert _client is not None, "lifespan 이 클라이언트를 만들기 전에 호출됐다"
     last: Exception | None = None
     for attempt in range(FM_RETRIES):
@@ -162,7 +173,12 @@ async def call_fm(
 
 
 async def generate_reply(messages: list[dict], dl: Deadline) -> str:
-    route = await classify(messages, call_fm)
+    route = await classify(
+        messages,
+        call_fm,
+        fallback_rules=FALLBACK_RULE_ROUTING,
+        language_aware=LANGUAGE_AWARE_PROMPT,
+    )
     log.info(
         "route: domain=%s urgency=%s context=%s persona=%s date=%s src=%s tools=%d",
         route.domain, route.urgency, route.context, route.persona,
@@ -186,14 +202,27 @@ async def generate_reply(messages: list[dict], dl: Deadline) -> str:
         route.tools = []
 
     content, _ = await generate(
-        messages, route, call_fm, MCP, MAX_TOKENS, budget, dl, ANSWER_RESERVE_S
+        messages,
+        route,
+        call_fm,
+        MCP,
+        MAX_TOKENS,
+        budget,
+        dl,
+        ANSWER_RESERVE_S,
+        language_aware=LANGUAGE_AWARE_PROMPT,
     )
 
     # content 가 비는 건 대개 reasoning 이 예산을 다 먹고 잘린 경우다.
     # max_tokens 를 더 올릴 수는 없으므로(2048 이 상한), 도구 없이 한 번 더 시도한다.
     if not content:
         log.warning("빈 content — 도구 없이 재시도 (elapsed %.0fs)", dl.elapsed)
-        data = await call_fm(messages, MAX_TOKENS)
+        data = await call_fm(
+            direct_answer_messages(
+                messages, route, language_aware=LANGUAGE_AWARE_PROMPT
+            ),
+            MAX_TOKENS,
+        )
         content = (data["choices"][0]["message"].get("content") or "").strip()
 
     if not content:
@@ -215,7 +244,29 @@ async def chat_completions(body: dict) -> dict[str, Any]:
         # 한 번만 더, 짧게 답을 받아 본다. 늦은 답이 없는 답보다 낫다.
         log.error("요청 시간 초과 — 직답으로 되살린다 (elapsed=%.1fs)", dl.elapsed)
         try:
-            data = await asyncio.wait_for(call_fm(messages, MAX_TOKENS), timeout=60)
+            # generate_reply가 취소되어 route를 못 받았어도, 언어만은 마지막 사용자
+            # 발화에서 되살린다. 도메인 추론·검색은 이 최후 복구 경로에서 하지 않는다.
+            recovery_route = fallback_route(
+                next(
+                    (
+                        str(m.get("content") or "")
+                        for m in reversed(messages)
+                        if m.get("role") == "user"
+                    ),
+                    "",
+                )
+            )
+            data = await asyncio.wait_for(
+                call_fm(
+                    direct_answer_messages(
+                        messages,
+                        recovery_route,
+                        language_aware=LANGUAGE_AWARE_PROMPT,
+                    ),
+                    MAX_TOKENS,
+                ),
+                timeout=60,
+            )
             content = (data["choices"][0]["message"].get("content") or "").strip()
         except Exception:
             log.exception("직답 폴백도 실패")
