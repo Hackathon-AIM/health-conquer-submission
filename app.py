@@ -15,6 +15,10 @@ from typing import Any
 import httpx
 from fastapi import FastAPI
 
+from generation import generate
+from mcp_client import MCPClient
+from router import classify
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("driver")
 
@@ -28,6 +32,12 @@ MAX_TOKENS = min(int(os.environ.get("FM_MAX_TOKENS", "2048")), SERVER_MAX_TOKENS
 TIMEOUT = float(os.environ.get("FM_TIMEOUT", "180"))
 FM_RETRIES = int(os.environ.get("FM_RETRIES", "3"))
 FM_BACKOFF = float(os.environ.get("FM_BACKOFF", "1.5"))
+
+# retrieval 단계에서 허용할 MCP 도구 호출 수. 대시보드 팁이 "제한하라"고 명시한다.
+RETRIEVAL_BUDGET = int(os.environ.get("RETRIEVAL_BUDGET", "6"))
+EMERGENCY_BUDGET = int(os.environ.get("EMERGENCY_BUDGET", "2"))
+
+MCP = MCPClient()
 
 # L2 는 사고과정을 별도 `reasoning` 필드로 뱉는데, 그게 2048 예산을 통째로 먹는다.
 # 실측(같은 질문):
@@ -116,27 +126,40 @@ async def call_fm(
 async def generate_reply(messages: list[dict]) -> str:
     """대화 맥락을 받아 다음 assistant 발화를 만든다.
 
-    TODO: 여기가 2단계 하네스로 바뀐다.
-      1) retrieval  — MCP tools + finalize_retrieval 만 주고 cite_uid 수집
-      2) generation — retrieve_relevant_content 하나만 주고 최종 답변 생성
-    또한 L2 는 single-turn 최적화라, 멀티턴 히스토리는 여기서
-    query rewriting / context summarization 으로 눌러줘야 한다.
+    입구에서 라우터가 도메인·응급도·맥락 충분성·페르소나를 정하고, 그 판정에 따라
+    되묻기 / 직답 / 검색-후-답변으로 갈린다.
+
+    TODO: L2 는 single-turn 최적화라 멀티턴 히스토리를 self-contained 질의로
+    눌러주는 단계가 아직 없다.
     """
-    data = await call_fm(messages, MAX_TOKENS)
-    choice = data["choices"][0]
-    content = (choice["message"].get("content") or "").strip()
+    route = await classify(messages, call_fm)
+    log.info(
+        "route: domain=%s urgency=%s context=%s persona=%s date=%s src=%s tools=%d",
+        route.domain, route.urgency, route.context, route.persona,
+        route.date_sensitive, route.source, len(route.tools),
+    )
+
+    # 결정적 맥락이 빠졌고 응급도 아니면, 답을 지어내지 말고 하나만 되묻는다.
+    # 09 문서 §4 — 맥락인지는 Consensus 두 번째로 큰 축(24.7%)이고 프론티어가 무너지는 곳이다.
+    if route.context == "missing_critical" and route.ask_back:
+        return route.ask_back
+
+    # 응급이면 검색을 짧게 끊는다. 실측에서 예산 6회를 다 쓰고 31초가 걸렸는데,
+    # 정작 근거는 "약물 부작용 자료에서 확인되지 않음"이라 답에 보탬이 없었다.
+    # 응급에서 값을 내는 건 근거 인용이 아니라 즉시 의뢰다.
+    budget = EMERGENCY_BUDGET if route.urgency == "emergency" else RETRIEVAL_BUDGET
+    content, retr = await generate(messages, route, call_fm, MCP, MAX_TOKENS, budget)
 
     # content 가 비는 건 대개 reasoning 이 예산을 다 먹고 잘린 경우다.
     # max_tokens 를 더 올릴 수는 없으므로(2048 이 상한), 한 번만 다시 시도한다.
     # 조용히 빈 문자열을 흘리면 그 문항은 통째로 0점이 된다.
     if not content:
-        log.warning("빈 content — finish_reason=%s, 재시도", choice.get("finish_reason"))
+        log.warning("빈 content — 재시도")
         data = await call_fm(messages, MAX_TOKENS)
-        choice = data["choices"][0]
-        content = (choice["message"].get("content") or "").strip()
+        content = (data["choices"][0]["message"].get("content") or "").strip()
 
     if not content:
-        log.error("재시도 후에도 빈 content — finish_reason=%s", choice.get("finish_reason"))
+        log.error("재시도 후에도 빈 content")
     return content
 
 
