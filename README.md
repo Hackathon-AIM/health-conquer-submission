@@ -20,10 +20,21 @@ Conquer Health 2026 · 팀 **AIM** 제출물 — 컨테이너화된 멀티턴 �
 제출은 이 브랜치 HEAD 의 **40자리 전체 SHA** 를 대시보드에 입력하는 방식이다.
 **마지막 제출이 최종 제출**이다.
 
+## 실행 모드
+
+기본은 **기준선(baseline)** 이다. 받은 대화를 손대지 않고 L2 에 그대로 넘기고
+그 출력만 돌려준다 — 라우터도 retrieval 도 타지 않는다.
+하네스 기여분을 재는 대조군이자, 하네스가 깨졌을 때 되돌아올 바닥이다.
+
+```bash
+BASELINE=1   # 기본 — L2 출력 그대로
+BASELINE=0   # 2단계 하네스 (라우터 → retrieval → generation)
+```
+
 ## 구조
 
 ```
-app.py             OpenAI 호환 서버. generate_reply() 안이 하네스가 들어갈 자리다.
+app.py             OpenAI 호환 서버. run_baseline() / run_harness() 로 갈린다.
 Dockerfile         python:3.13-slim + uvicorn
 requirements.txt   fastapi / uvicorn / httpx
 .dockerignore      빌드 컨텍스트 부풀지 않게. 5분 제한 때문에 중요하다.

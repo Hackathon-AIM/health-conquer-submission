@@ -3,8 +3,8 @@
 평가자(Evaluator)가 각 대화 턴을 POST /v1/chat/completions 로 보내고,
 이 서버가 다음 assistant 응답을 돌려준다.
 
-지금은 L2 로 그대로 넘기는 최소 관통 버전이다.
-이 파일의 `generate_reply()` 안이 retrieval/generation 2단계 하네스로 바뀔 자리다.
+기본은 **기준선(baseline)** 이다 — 받은 대화를 L2 에 그대로 넘기고 그 출력만 돌려준다.
+2단계 하네스(라우터 → retrieval → generation)는 `BASELINE=0` 으로 켠다.
 """
 
 import asyncio
@@ -47,6 +47,11 @@ MCP = MCPClient()
 # 품질 A/B 는 따로 하되 기본값은 off 로 둔다.
 ENABLE_THINKING = os.environ.get("FM_THINKING", "0") == "1"
 
+# 기준선 모드 — 라우터·retrieval·generation 하네스를 전부 건너뛰고 L2 로 그대로 넘긴다.
+# 하네스가 실제로 얼마나 보태는지 재는 대조군이고, 하네스가 깨졌을 때 되돌아올 바닥이다.
+# 하네스를 다시 태우려면 BASELINE=0.
+BASELINE = os.environ.get("BASELINE", "1") == "1"
+
 app = FastAPI(title="AIM conversation driver")
 
 
@@ -57,11 +62,12 @@ async def announce() -> None:
     if not FM_KEY:
         log.error("LUNIT_FM_API_KEY 가 비어 있다. 모든 생성 요청이 실패한다.")
     log.info(
-        "driver up — model=%s url=%s max_tokens=%d thinking=%s",
+        "driver up — model=%s url=%s max_tokens=%d thinking=%s mode=%s",
         FM_MODEL,
         FM_URL,
         MAX_TOKENS,
         ENABLE_THINKING,
+        "baseline" if BASELINE else "harness",
     )
 
 
@@ -123,11 +129,19 @@ async def call_fm(
     raise last
 
 
-async def generate_reply(messages: list[dict]) -> str:
-    """대화 맥락을 받아 다음 assistant 발화를 만든다.
+async def run_baseline(messages: list[dict]) -> str:
+    """기준선 — 받은 대화를 손대지 않고 L2 에 그대로 넘긴다.
 
-    입구에서 라우터가 도메인·응급도·맥락 충분성·페르소나를 정하고, 그 판정에 따라
-    되묻기 / 직답 / 검색-후-답변으로 갈린다.
+    라우터도 retrieval 도 없다. 하네스가 붙기 전 점수가 여기서 나온다.
+    """
+    data = await call_fm(messages, MAX_TOKENS)
+    return (data["choices"][0]["message"].get("content") or "").strip()
+
+
+async def run_harness(messages: list[dict]) -> str:
+    """2단계 하네스 — 라우팅 후 되묻기 / 직답 / 검색-후-답변으로 갈린다.
+
+    입구에서 라우터가 도메인·응급도·맥락 충분성·페르소나를 정한다.
 
     TODO: L2 는 single-turn 최적화라 멀티턴 히스토리를 self-contained 질의로
     눌러주는 단계가 아직 없다.
@@ -149,14 +163,22 @@ async def generate_reply(messages: list[dict]) -> str:
     # 응급에서 값을 내는 건 근거 인용이 아니라 즉시 의뢰다.
     budget = EMERGENCY_BUDGET if route.urgency == "emergency" else RETRIEVAL_BUDGET
     content, retr = await generate(messages, route, call_fm, MCP, MAX_TOKENS, budget)
+    return content
+
+
+async def generate_reply(messages: list[dict]) -> str:
+    """대화 맥락을 받아 다음 assistant 발화를 만든다.
+
+    기본은 기준선(그대로 넘기기)이다. BASELINE=0 이면 2단계 하네스를 태운다.
+    """
+    content = await (run_baseline(messages) if BASELINE else run_harness(messages))
 
     # content 가 비는 건 대개 reasoning 이 예산을 다 먹고 잘린 경우다.
     # max_tokens 를 더 올릴 수는 없으므로(2048 이 상한), 한 번만 다시 시도한다.
     # 조용히 빈 문자열을 흘리면 그 문항은 통째로 0점이 된다.
     if not content:
         log.warning("빈 content — 재시도")
-        data = await call_fm(messages, MAX_TOKENS)
-        content = (data["choices"][0]["message"].get("content") or "").strip()
+        content = await run_baseline(messages)
 
     if not content:
         log.error("재시도 후에도 빈 content")
