@@ -123,10 +123,7 @@ async def generate(
             "role": "system",
             "content": (
                 "Retrieved evidence for this question. Cite these as [1], [2] and cite "
-                "nothing else. A passage that does not bear on the question is simply "
-                "irrelevant — ignore it, answer from your medical knowledge, and cite "
-                "nothing. Never tell the reader that the evidence was unhelpful.\n\n"
-                + result.as_prompt()
+                "nothing else. If they do not answer it, say so.\n\n" + result.as_prompt()
             ),
         },
     )
