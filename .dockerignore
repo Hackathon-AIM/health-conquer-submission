@@ -21,3 +21,6 @@ data/probe
 # 제출 이미지에도 넣지 않는다 (make 타깃도 실행 차단 상태).
 data/extract_redflags.py
 data/build_dicts.py
+# 서빙에 쓰이지 않는다
+static
+evals
