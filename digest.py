@@ -74,9 +74,14 @@ MAP_PROMPT = """Extract from the SOURCE only what could help answer the QUESTION
 Rules:
 - Copy numbers, doses, ages, thresholds, code numbers, article numbers, dates and
   drug names EXACTLY as they appear. Never round, never paraphrase a number.
+- Keep the condition attached to every fact. "1,000mg" and "1,000mg in adults without
+  liver disease" are different facts; dropping the condition makes the note wrong.
+- Keep negations and exclusions. "Not indicated for", "contraindicated in", "except"
+  carry as much weight as the positive statements.
 - Write short factual lines, not prose. No preamble, no conclusion.
 - If the SOURCE contains nothing relevant to the QUESTION, reply with exactly: NONE
-- Do not add anything that is not in the SOURCE.
+- Do not add anything that is not in the SOURCE, and do not resolve a contradiction
+  inside the source — record both sides.
 
 QUESTION:
 {query}
@@ -90,12 +95,15 @@ REFINE_PROMPT = """You are building running notes to answer the QUESTION.
 You already have NOTES SO FAR. Read the NEW SOURCE and return the updated notes.
 
 Rules:
-- Keep every fact already in the notes unless the new source corrects it.
+- Keep every fact already in the notes. Drop one only if the new source explicitly
+  corrects it, and then say so on that line.
 - Add only what is new and could help answer the question.
 - Copy numbers, doses, ages, thresholds, code numbers, article numbers, dates and
   drug names EXACTLY as they appear. Never round, never paraphrase a number.
+- Keep the condition attached to every fact, and keep negations and exclusions.
 - Short factual lines, not prose. No preamble.
-- Return the complete updated notes, not a diff.
+- Return the COMPLETE updated notes, not a diff. Notes you leave out are lost —
+  nothing downstream can recover them.
 
 QUESTION:
 {query}

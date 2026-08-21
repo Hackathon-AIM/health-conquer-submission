@@ -150,8 +150,15 @@ are relevant by calling {finalize}.
 Rules:
 - Search first to locate material, then OPEN the pages/articles to read the actual text.
   Only opened content carries a cite_uid, and only a cite_uid can be cited.
-- Prefer specific, descriptive search queries over short keywords. English queries work well
-  against the guideline corpus even when the user wrote Korean.
+- Some tools are LOOKUP steps: they hand back an identifier (an mst, a doc_id with a page
+  range, a code) and carry no citable text. When you get one, read the identifier out of the
+  result and call the tool it points to. Calling the same lookup tool again with a reworded
+  query spends your budget and returns the same thing.
+- Match the query language to the source, not to the user. Korean law, Korean drug approval,
+  HIRA billing and the hira corpus are Korean. DailyMed, PubMed, FAERS and the clinical
+  guideline corpus (EAU, NCCN) are English.
+- index_get_relevant_nodes wants a long descriptive sentence; index_keyword_search wants two
+  or three exact terms, comma separated, as they would appear verbatim in the page.
 - You have at most {budget} tool calls. When they run out, call {finalize} with what you have.
 - Call {finalize} with status "no_evidence" if the query needs no lookup, and with "partial"
   if you found something but it does not fully settle the question.
