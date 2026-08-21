@@ -180,6 +180,71 @@ def test_blood_pressure_medication_interaction_stays_blocking_without_evidence()
     assert safety["blocking_issues"] == ["unsupported_blocking_claim"]
 
 
+def test_evidence_backed_interaction_and_dosage_claims_are_not_blocking() -> None:
+    evidence = [RetrievalEvidence(id="e1", source="drug", content="Drug label evidence")]
+    draft = (
+        "이부프로펜은 일부 혈압약의 효과를 약하게 만들 수 있습니다. "
+        "이 약은 10 mg 용량으로 복용할 수 있습니다."
+    )
+    claims = ClaimExtractor().extract(draft, evidence)
+    groundedness = GroundednessVerifier().verify(claims, evidence)
+    safety = ClinicalSafetyVerifier().verify(draft, "NON_EMERGENT", {}, groundedness)
+
+    assert [claim.claim_type for claim in claims] == ["interaction", "dosage"]
+    assert [claim.evidence_ids for claim in claims] == [["e1"], ["e1"]]
+    assert groundedness["passed"] is True
+    assert safety["passed"] is True
+
+
+def test_absolute_safety_claim_blocks_even_with_evidence() -> None:
+    evidence = [RetrievalEvidence(id="e1", source="drug", content="Drug label evidence")]
+    groundedness = GroundednessVerifier().verify(
+        [
+            ClinicalClaim(
+                id="c1",
+                text="이 약은 반드시 안전합니다.",
+                claim_type="interaction",
+                evidence_ids=["e1"],
+            )
+        ],
+        evidence,
+    )
+    safety = ClinicalSafetyVerifier().verify(
+        "이 약은 반드시 안전합니다.", "NON_EMERGENT", {}, groundedness
+    )
+
+    assert groundedness["passed"] is False
+    assert safety["blocking_issues"] == ["unsupported_blocking_claim"]
+
+
+def test_composer_preserves_evidence_backed_medication_draft() -> None:
+    evidence = [
+        RetrievalEvidence(
+            id="cite-med-1",
+            source="lunit_mcp",
+            content="NSAID interaction evidence",
+        )
+    ]
+    draft = "이부프로펜은 일부 혈압약의 효과를 약하게 만들 수 있습니다."
+    safety = {
+        "passed": False,
+        "issues": ["unsupported_blocking_claim"],
+        "blocking_issues": ["unsupported_blocking_claim"],
+        "advisory_issues": [],
+    }
+    answer, status = ResponseComposer().compose(
+        draft,
+        "NON_EMERGENT",
+        QueryAnalysis(intent="medication_safety"),
+        evidence,
+        safety,
+    )
+
+    assert status == "pass"
+    assert draft in answer
+    assert "참고한 근거: cite-med-1" in answer
+
+
 def test_lab_unit_mg_dl_is_not_dosage_claim() -> None:
     draft = "정상 수치는 보통 LDL 100 mg/dL 미만을 권장합니다."
     claims = ClaimExtractor().extract(draft, [])

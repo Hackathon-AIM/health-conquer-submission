@@ -135,9 +135,9 @@ class LunitL2Harness:
         if any(term in lowered for term in ["hira", "급여", "보험", "심평원", "coverage"]):
             prioritized_names.extend(
                 [
+                    "index_get_page_content",
                     "index_get_relevant_nodes",
                     "index_keyword_search",
-                    "index_get_page_content",
                     "rag_vector_query",
                     "openapi_hira_get_drug_price",
                 ]
@@ -158,10 +158,10 @@ class LunitL2Harness:
         ):
             prioritized_names.extend(
                 [
-                    "index_list_documents",
+                    "index_get_page_content",
                     "index_get_relevant_nodes",
                     "index_keyword_search",
-                    "index_get_page_content",
+                    "rag_vector_query",
                 ]
             )
         if any(term in lowered for term in ["notice", "updates", "고시", "심의사례"]):
@@ -192,10 +192,9 @@ class LunitL2Harness:
         if not prioritized_names:
             prioritized_names.extend(
                 [
-                    "rag_get_all_data_sources",
                     "rag_vector_query",
-                    "index_get_relevant_nodes",
                     "index_get_page_content",
+                    "index_get_relevant_nodes",
                     "adr_retrieve_drug_info",
                 ]
             )
@@ -275,32 +274,53 @@ class LunitL2Harness:
             },
         ]
 
-        for _ in range(self.settings.l2_generation_tool_budget + 1):
-            data = await self._chat_completion(messages, self.generation_tools())
-            assistant_message = dict(data["choices"][0]["message"])
-            tool_calls = assistant_message.get("tool_calls") or []
-            if not tool_calls:
-                return str(assistant_message.get("content") or "")
-            messages.append(assistant_message)
-            for tool_call in tool_calls:
-                name = tool_call.get("function", {}).get("name")
-                arguments = self._parse_arguments(
-                    tool_call.get("function", {}).get("arguments")
+        data = await self._chat_completion(messages, self.generation_tools())
+        assistant_message = dict(data["choices"][0]["message"])
+        tool_calls = assistant_message.get("tool_calls") or []
+        if not tool_calls:
+            content = str(assistant_message.get("content") or "")
+            return content or self._fallback_final_answer(message, analysis)
+
+        messages.append(assistant_message)
+        retrieval_used = False
+        for tool_call in tool_calls:
+            name = tool_call.get("function", {}).get("name")
+            arguments = self._parse_arguments(
+                tool_call.get("function", {}).get("arguments")
+            )
+            if name == "retrieve_relevant_content" and not retrieval_used:
+                retrieval_used = True
+                content = await self.retrieve_relevant_content(
+                    str(arguments.get("query") or message)
                 )
-                if name != "retrieve_relevant_content":
-                    content = f"Unsupported generation tool: {name}"
-                else:
-                    content = await self.retrieve_relevant_content(
-                        str(arguments.get("query") or message)
-                    )
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_call.get("id"),
-                        "content": content,
-                    }
+            elif name == "retrieve_relevant_content":
+                content = (
+                    "Retrieval was already performed for this request. "
+                    "Write the final answer using the prior retrieval result."
                 )
-        raise RuntimeError("Lunit L2 generation tool budget exhausted.")
+            else:
+                content = f"Unsupported generation tool: {name}"
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.get("id"),
+                    "content": content,
+                }
+            )
+
+        data = await self._chat_completion(messages, [])
+        final_message = dict(data["choices"][0]["message"])
+        content = str(final_message.get("content") or "")
+        if content:
+            return content
+        fallback = self._fallback_final_answer(message, analysis)
+        note = str(self.last_trace.get("l2_finalize_note") or "")
+        self.last_trace["l2_finalize_note"] = (
+            f"{note}; final generation returned empty content, harness fallback used"
+            if note
+            else "final generation returned empty content, harness fallback used"
+        )
+        return fallback
 
     async def retrieve_relevant_content(self, query: str) -> str:
         selection, evidence = await self._run_retrieval_phase(query)
@@ -363,6 +383,15 @@ class LunitL2Harness:
                 if name == "finalize_retrieval":
                     selection = self._normalize_selection(arguments)
                     evidence = self._evidence_from_selection(selection, tool_results)
+                    if not evidence:
+                        evidence = await self._direct_evidence_probe(
+                            query, retrieval_tools
+                        )
+                        if evidence:
+                            selection = self._selection_from_evidence(
+                                evidence,
+                                "direct evidence probe after empty finalize_retrieval",
+                            )
                     return selection, evidence
 
                 result = await self.mcp_client.call_tool(str(name), arguments)
@@ -379,7 +408,93 @@ class LunitL2Harness:
         evidence = self._evidence_from_selection(selection, tool_results)
         if not evidence:
             evidence = self._evidence_from_tool_results(tool_results)
+        if not evidence:
+            evidence = await self._direct_evidence_probe(query, retrieval_tools)
+            if evidence:
+                selection = self._selection_from_evidence(
+                    evidence,
+                    "direct evidence probe after tool budget or missing finalize_retrieval",
+                )
         return selection, evidence
+
+    async def _direct_evidence_probe(
+        self, query: str, retrieval_tools: list[dict[str, Any]]
+    ) -> list[RetrievalEvidence]:
+        if int(self.last_trace.get("l2_mcp_tool_call_count") or 0) >= self.settings.l2_retrieval_tool_budget:
+            return []
+        for tool in retrieval_tools:
+            function = tool.get("function") or {}
+            name = str(function.get("name") or "")
+            if name == "finalize_retrieval" or not self._is_evidence_producing_tool(name):
+                continue
+            arguments = self._arguments_from_tool_schema(function, query)
+            try:
+                result = await self.mcp_client.call_tool(name, arguments)
+            except Exception:
+                continue
+            self.last_trace["l2_mcp_tool_call_count"] = (
+                int(self.last_trace.get("l2_mcp_tool_call_count") or 0) + 1
+            )
+            evidence = self._evidence_from_tool_results(
+                [{"tool_name": name, "arguments": arguments, "result": result}]
+            )
+            if evidence:
+                return evidence
+            if int(self.last_trace.get("l2_mcp_tool_call_count") or 0) >= self.settings.l2_retrieval_tool_budget:
+                return []
+        return []
+
+    def _arguments_from_tool_schema(
+        self, function: dict[str, Any], query: str
+    ) -> dict[str, Any]:
+        parameters = function.get("parameters") or {}
+        properties = parameters.get("properties") or {}
+        required = set(parameters.get("required") or [])
+        arguments: dict[str, Any] = {}
+        for key in [
+            "query",
+            "q",
+            "text",
+            "keyword",
+            "keywords",
+            "search_query",
+            "question",
+            "input",
+        ]:
+            if key in properties:
+                arguments[key] = query
+                break
+        for key in required:
+            if key in arguments:
+                continue
+            spec = properties.get(key) or {}
+            value_type = spec.get("type")
+            if value_type == "integer":
+                arguments[key] = 1
+            elif value_type == "number":
+                arguments[key] = 1.0
+            elif value_type == "boolean":
+                arguments[key] = False
+            elif value_type == "array":
+                arguments[key] = [query]
+            else:
+                arguments[key] = query
+        return arguments
+
+    def _selection_from_evidence(
+        self, evidence: list[RetrievalEvidence], note: str
+    ) -> dict[str, Any]:
+        return {
+            "status": "partial",
+            "items": [
+                {
+                    "cite_uid": item.cite_uid or item.id,
+                    "relevance_score": item.relevance_score or 0.5,
+                }
+                for item in evidence[: self.settings.evidence_limit]
+            ],
+            "note": note,
+        }
 
     def _selection_from_budget_exhaustion(
         self, tool_results: list[dict[str, Any]]
@@ -465,20 +580,21 @@ class LunitL2Harness:
         return found
 
     async def _chat_completion(
-        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None
     ) -> dict[str, Any]:
         if not self.settings.model_api_base:
             raise RuntimeError("Lunit L2 model endpoint is not configured.")
         headers: dict[str, str] = {}
         if self.settings.model_api_key:
             headers["Authorization"] = f"Bearer {self.settings.model_api_key}"
-        payload = {
+        payload: dict[str, Any] = {
             "model": self.settings.model_name,
             "temperature": 0,
             "messages": messages,
-            "tools": tools,
-            "tool_choice": "auto",
         }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
         url = self.settings.model_api_base.rstrip("/") + "/chat/completions"
         if self._http_client is not None:
             response = await self._http_client.post(url, json=payload, headers=headers)
@@ -488,6 +604,53 @@ class LunitL2Harness:
             response = await client.post(url, json=payload, headers=headers)
             response.raise_for_status()
             return response.json()
+
+    def _fallback_final_answer(self, message: str, analysis: QueryAnalysis) -> str:
+        korean = any("가" <= char <= "힣" for char in message)
+        if self.last_evidence:
+            evidence_lines = []
+            for index, item in enumerate(self.last_evidence[:3], start=1):
+                title = item.title or item.cite_uid or item.id
+                snippet = self._truncate(" ".join(item.content.split()), 320)
+                evidence_lines.append(f"{index}. {title}: {snippet}")
+            if korean:
+                return (
+                    "확인한 근거를 바탕으로 요약하면 다음과 같습니다.\n\n"
+                    + "\n".join(evidence_lines)
+                    + "\n\n다만 개인의 진단, 복용 약, 검사 수치, 동반질환에 따라 해석이 달라질 수 있습니다. "
+                    "응급 증상이나 빠른 악화가 있으면 즉시 의료진의 도움을 받으세요."
+                )
+            return (
+                "Based on the retrieved evidence, the key points are:\n\n"
+                + "\n".join(evidence_lines)
+                + "\n\nInterpretation can change with diagnosis, medicines, test values, and comorbidities. "
+                "Seek urgent care for emergency symptoms or rapid worsening."
+            )
+        if analysis.intent == "medication_safety":
+            if korean:
+                return (
+                    "현재 인용 가능한 약물 근거를 충분히 확보하지 못했습니다. 약물 병용은 복용 중인 약 이름, "
+                    "용량, 신장 기능, 간 기능, 임신 여부, 다른 질환에 따라 위험이 달라질 수 있습니다. "
+                    "반복 복용하거나 새 약을 추가하기 전에는 의사나 약사에게 확인하세요. 호흡곤란, 흉통, "
+                    "의식 저하, 심한 알레르기 반응은 즉시 119 또는 응급실 도움을 받으세요."
+                )
+            return (
+                "I could not retrieve enough citable medication evidence. Interaction risk can depend on the exact "
+                "drug names, doses, kidney or liver function, pregnancy status, and other conditions. Check with a "
+                "clinician or pharmacist before repeated use or adding a new medicine. Seek emergency help for "
+                "trouble breathing, chest pain, confusion, or a severe allergic reaction."
+            )
+        if korean:
+            return (
+                "현재 인용 가능한 근거를 충분히 확보하지 못했습니다. 일반적인 건강 정보로는 설명할 수 있지만, "
+                "개인 상황에 따라 판단이 달라질 수 있으므로 증상 경과, 복용 약, 검사 수치, 기저질환을 함께 "
+                "의료진에게 알려주세요. 응급 증상이나 빠른 악화가 있으면 즉시 진료를 받으세요."
+            )
+        return (
+            "I could not retrieve enough citable evidence. I can provide only general health information, and the "
+            "answer may change with symptoms, medicines, test values, and medical history. Seek urgent care for "
+            "emergency symptoms or rapid worsening."
+        )
 
     def _generation_system_prompt(self) -> str:
         base = (

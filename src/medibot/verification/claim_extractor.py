@@ -36,7 +36,9 @@ class ClaimExtractor:
                     id=f"claim-{idx}",
                     text=sentence,
                     claim_type=claim_type,
-                    evidence_ids=evidence_ids if claim_type in {"interaction", "risk"} else [],
+                    evidence_ids=evidence_ids
+                    if claim_type in {"dosage", "interaction", "recommendation", "risk"}
+                    else [],
                 )
             )
         return claims

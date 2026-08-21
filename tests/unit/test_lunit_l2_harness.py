@@ -4,7 +4,12 @@ import json
 import httpx
 
 from medibot.config.settings import Settings
-from medibot.core.schemas import ClinicalState, QueryAnalysis, ResponseRequirements
+from medibot.core.schemas import (
+    ClinicalState,
+    QueryAnalysis,
+    ResponseRequirements,
+    RetrievalEvidence,
+)
 from medibot.reasoning.lunit_harness import LunitL2Harness
 from medibot.sources.mcp_client import LunitMCPClient
 
@@ -100,10 +105,9 @@ def test_mcp_tool_selection_uses_deterministic_priority_order() -> None:
     )
 
     assert [tool["name"] for tool in selected] == [
-        "index_list_documents",
+        "index_get_page_content",
         "index_get_relevant_nodes",
         "index_keyword_search",
-        "index_get_page_content",
     ]
 
 
@@ -144,9 +148,9 @@ def test_source_specific_tool_selection() -> None:
     pubmed = harness._select_mcp_tools(tools, "latest PubMed study evidence")
 
     assert [tool["name"] for tool in hira][:3] == [
+        "index_get_page_content",
         "index_get_relevant_nodes",
         "index_keyword_search",
-        "index_get_page_content",
     ]
     assert [tool["name"] for tool in law] == [
         "openapi_law_search",
@@ -326,7 +330,7 @@ def test_lunit_harness_runs_generation_retrieval_and_preserves_cite_uid() -> Non
                 )
         chat_calls.append(payload)
         messages = payload["messages"]
-        tools = [tool["function"]["name"] for tool in payload["tools"]]
+        tools = [tool["function"]["name"] for tool in payload.get("tools", [])]
         if tools == ["retrieve_relevant_content"] and messages[-1]["role"] == "user":
             return _chat_response(
                 payload["model"],
@@ -408,6 +412,301 @@ def test_lunit_harness_runs_generation_retrieval_and_preserves_cite_uid() -> Non
     assert harness.last_evidence[0].cite_uid == "cite-ckd-1"
     assert harness.last_evidence[0].raw_tool_name == "index_get_page_content"
     assert chat_calls[0]["tools"][0]["function"]["name"] == "retrieve_relevant_content"
+    assert "tools" not in chat_calls[-1]
+
+
+def test_generation_retrieval_tool_is_used_only_once() -> None:
+    settings = Settings(
+        model_api_base="https://lunit.test/v1",
+        model_name="Lunit/L2-preview",
+        model_api_key="lunit_test",
+        mcp_url="https://mcp.test/mcp",
+        final_model_provider="lunit_l2",
+        require_l2_final=True,
+        allow_fallback=False,
+    )
+    generation_tool_payloads = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal generation_tool_payloads
+        payload = json.loads(request.content)
+        if str(request.url).startswith(settings.mcp_url):
+            if payload["method"] == "tools/list":
+                return httpx.Response(
+                    200,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": payload["id"],
+                        "result": {
+                            "tools": [
+                                {
+                                    "name": "rag_vector_query",
+                                    "description": "Retrieve PubMed-like evidence.",
+                                    "inputSchema": {"type": "object", "properties": {}},
+                                }
+                            ]
+                        },
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "Trial evidence summary cite_uid=cite-repeat-1",
+                            }
+                        ]
+                    },
+                },
+            )
+
+        tools = [tool["function"]["name"] for tool in payload.get("tools", [])]
+        if tools == ["retrieve_relevant_content"]:
+            generation_tool_payloads += 1
+            return _chat_response(
+                payload["model"],
+                {
+                    "tool_calls": [
+                        _tool_call(
+                            "gen-repeat-1",
+                            "retrieve_relevant_content",
+                            {"query": "trial evidence"},
+                        )
+                    ],
+                    "content": None,
+                },
+            )
+        if "finalize_retrieval" in tools and payload["messages"][-1]["role"] == "user":
+            return _chat_response(
+                payload["model"],
+                {
+                    "tool_calls": [
+                        _tool_call("ret-repeat-1", "rag_vector_query", {"query": "trial"})
+                    ],
+                    "content": None,
+                },
+            )
+        if "finalize_retrieval" in tools and payload["messages"][-1]["role"] == "tool":
+            return _chat_response(
+                payload["model"],
+                {
+                    "tool_calls": [
+                        _tool_call(
+                            "ret-repeat-2",
+                            "finalize_retrieval",
+                            {
+                                "status": "partial",
+                                "items": [
+                                    {
+                                        "cite_uid": "cite-repeat-1",
+                                        "relevance_score": 0.8,
+                                    }
+                                ],
+                                "note": "ok",
+                            },
+                        )
+                    ],
+                    "content": None,
+                },
+            )
+        assert "tools" not in payload
+        return _chat_response(
+            payload["model"],
+            {"content": "근거에 따르면 임상 연구 결과를 제한적으로 해석해야 합니다 [cite-repeat-1]."},
+        )
+
+    async def run() -> str:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            harness = LunitL2Harness(
+                settings,
+                mcp_client=LunitMCPClient(settings, http_client=client),
+                http_client=client,
+            )
+            return await harness.generate(
+                "PubMed 근거를 알려줘",
+                ClinicalState(session_id="test"),
+                QueryAnalysis(intent="clinical_evidence", retrieval_need="required"),
+                ResponseRequirements(),
+                [],
+            )
+
+    answer = asyncio.run(run())
+
+    assert generation_tool_payloads == 1
+    assert "cite-repeat-1" in answer
+
+
+def test_generation_no_evidence_does_not_exhaust_tool_budget() -> None:
+    settings = Settings(
+        model_api_base="https://lunit.test/v1",
+        model_name="Lunit/L2-preview",
+        model_api_key="lunit_test",
+        mcp_url="https://mcp.test/mcp",
+        final_model_provider="lunit_l2",
+        require_l2_final=True,
+        allow_fallback=False,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        if str(request.url).startswith(settings.mcp_url):
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": {"tools": []} if payload["method"] == "tools/list" else {},
+                },
+            )
+
+        tools = [tool["function"]["name"] for tool in payload.get("tools", [])]
+        messages = payload["messages"]
+        if tools == ["retrieve_relevant_content"]:
+            return _chat_response(
+                payload["model"],
+                {
+                    "tool_calls": [
+                        _tool_call(
+                            "gen-no-evidence-1",
+                            "retrieve_relevant_content",
+                            {"query": "rare evidence"},
+                        )
+                    ],
+                    "content": None,
+                },
+            )
+        if "finalize_retrieval" in tools:
+            return _chat_response(
+                payload["model"],
+                {
+                    "tool_calls": [
+                        _tool_call(
+                            "ret-no-evidence-1",
+                            "finalize_retrieval",
+                            {"status": "no_evidence", "items": [], "note": "none"},
+                        )
+                    ],
+                    "content": None,
+                },
+            )
+        assert messages[-1]["role"] == "tool"
+        assert "tools" not in payload
+        return _chat_response(
+            payload["model"],
+            {"content": "인용 가능한 근거는 부족하지만, 증상이 악화되면 진료가 필요합니다."},
+        )
+
+    async def run() -> tuple[str, LunitL2Harness]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            harness = LunitL2Harness(
+                settings,
+                mcp_client=LunitMCPClient(settings, http_client=client),
+                http_client=client,
+            )
+            answer = await harness.generate(
+                "희귀 질환 근거가 있어?",
+                ClinicalState(session_id="test"),
+                QueryAnalysis(intent="clinical_evidence", retrieval_need="required"),
+                ResponseRequirements(),
+                [],
+            )
+            return answer, harness
+
+    answer, harness = asyncio.run(run())
+
+    assert "인용 가능한 근거" in answer
+    assert harness.last_trace["l2_retrieval_phase_status"] == "no_evidence"
+    assert harness.last_evidence == []
+
+
+def test_empty_finalize_triggers_direct_evidence_probe() -> None:
+    settings = Settings(
+        model_api_base="https://lunit.test/v1",
+        model_name="Lunit/L2-preview",
+        model_api_key="lunit_test",
+        mcp_url="https://mcp.test/mcp",
+        l2_retrieval_tool_budget=3,
+    )
+    called_tools: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        if str(request.url).startswith(settings.mcp_url):
+            if payload["method"] == "tools/list":
+                return httpx.Response(
+                    200,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": payload["id"],
+                        "result": {
+                            "tools": [
+                                {
+                                    "name": "index_get_page_content",
+                                    "description": "Get citable page content.",
+                                    "inputSchema": {
+                                        "type": "object",
+                                        "properties": {"query": {"type": "string"}},
+                                    },
+                                }
+                            ]
+                        },
+                    },
+                )
+            called_tools.append(payload["params"])
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "Guideline page content cite_uid=cite-direct-probe",
+                            }
+                        ]
+                    },
+                },
+            )
+
+        return _chat_response(
+            payload["model"],
+            {
+                "tool_calls": [
+                    _tool_call(
+                        "ret-empty-finalize",
+                        "finalize_retrieval",
+                        {"status": "no_evidence", "items": [], "note": "none"},
+                    )
+                ],
+                "content": None,
+            },
+        )
+
+    async def run() -> tuple[dict, list[RetrievalEvidence], LunitL2Harness]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            harness = LunitL2Harness(
+                settings,
+                mcp_client=LunitMCPClient(settings, http_client=client),
+                http_client=client,
+            )
+            harness.last_trace = {"l2_mcp_tool_call_count": 0}
+            selection, evidence = await harness._run_retrieval_phase(
+                "blood pressure guideline"
+            )
+            return selection, evidence, harness
+
+    selection, evidence, harness = asyncio.run(run())
+
+    assert called_tools[0]["name"] == "index_get_page_content"
+    assert called_tools[0]["arguments"] == {"query": "blood pressure guideline"}
+    assert selection["status"] == "partial"
+    assert evidence[0].cite_uid == "cite-direct-probe"
+    assert harness.last_trace["l2_mcp_tool_call_count"] == 1
 
 
 def test_retrieval_fallback_preserves_cite_uid_when_finalize_is_missing() -> None:

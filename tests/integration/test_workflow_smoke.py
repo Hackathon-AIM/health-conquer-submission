@@ -208,7 +208,7 @@ def test_lunit_l2_workflow_uses_mcp_harness_and_writes_trace(tmp_path: Path) -> 
                 )
 
             messages = payload["messages"]
-            tool_names = [tool["function"]["name"] for tool in payload["tools"]]
+            tool_names = [tool["function"]["name"] for tool in payload.get("tools", [])]
             if tool_names == ["retrieve_relevant_content"] and messages[-1]["role"] == "user":
                 return _workflow_chat_response(
                     settings.model_name,

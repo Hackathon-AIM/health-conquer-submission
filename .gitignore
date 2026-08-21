@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.tmp-pytest/
 .ruff_cache/
 .deepeval/
 .venv/
