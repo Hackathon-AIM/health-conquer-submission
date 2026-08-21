@@ -59,6 +59,8 @@ class StageStats:
     seconds: float = 0.0
     max_prompt_tokens: int = 0
     max_completion_tokens: int = 0
+    reasoning_chars: int = 0
+    content_chars: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         thinking_share = (
@@ -74,6 +76,10 @@ class StageStats:
             "prompt_tokens_max": self.max_prompt_tokens,
             "completion_tokens_max": self.max_completion_tokens,
             "thinking_share": round(thinking_share, 3),
+            # 서버가 reasoning_tokens 를 안 주므로 문자 기준 비중도 같이 낸다.
+            "reasoning_char_share": round(
+                self.reasoning_chars / (self.reasoning_chars + self.content_chars), 3
+            ) if (self.reasoning_chars + self.content_chars) else 0.0,
             "truncated": self.truncated,
             "empty": self.empty,
             "seconds_avg": round(self.seconds / self.calls, 2) if self.calls else 0.0,
@@ -112,9 +118,10 @@ class Telemetry:
         prompt = int(_f(usage.get("prompt_tokens")))
         completion = int(_f(usage.get("completion_tokens")))
 
-        # vLLM 은 사고 토큰을 completion_tokens_details.reasoning_tokens 로 준다.
-        # 없으면 reasoning 필드 길이로 대신 세지 않는다 — 문자는 토큰이 아니고,
-        # 추정으로 채운 값이 실측처럼 보이면 그게 더 나쁘다.
+        # vLLM 은 사고 토큰을 completion_tokens_details.reasoning_tokens 로 줄 수 있다.
+        # 이 엔드포인트는 실측으로 그 필드를 주지 않는다(2026-08-22 확인).
+        # 없으면 0 이다 — 문자 길이로 대신 채우지 않는다. 문자는 토큰이 아니고,
+        # 추정으로 메운 값이 실측처럼 보이면 그게 더 나쁘다.
         details = usage.get("completion_tokens_details")
         reasoning = int(_f((details or {}).get("reasoning_tokens"))) if isinstance(details, dict) else 0
 
@@ -124,6 +131,10 @@ class Telemetry:
         message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
         content = (message.get("content") or "") if isinstance(message, dict) else ""
         finish = str(choice.get("finish_reason") or "")
+        # L2 는 사고과정을 별도 `reasoning` 필드로 준다. 토큰 수는 안 알려주므로
+        # 문자 길이라도 남긴다 — 팀이 측정해 둔 '사고 비중 46~50%' 를 회차마다
+        # 다시 확인할 수 있는 유일한 신호다. 이름에 chars 를 박아 토큰과 헷갈리지 않게 한다.
+        reasoning_chars = len(str(message.get("reasoning") or "")) if isinstance(message, dict) else 0
 
         with self._lock:
             stats = self._stages.setdefault(stage, StageStats())
@@ -134,6 +145,8 @@ class Telemetry:
             stats.seconds += seconds
             stats.max_prompt_tokens = max(stats.max_prompt_tokens, prompt)
             stats.max_completion_tokens = max(stats.max_completion_tokens, completion)
+            stats.reasoning_chars += reasoning_chars
+            stats.content_chars += len(str(content))
             if finish == "length":
                 stats.truncated += 1
             if not str(content).strip():
@@ -150,6 +163,8 @@ class Telemetry:
             "content_chars": len(str(content)),
             "elapsed_s": round(seconds, 2),
         }
+        if reasoning_chars:
+            line["reasoning_chars"] = reasoning_chars
         if reasoning:
             line["reasoning_tokens"] = reasoning
             if completion:
