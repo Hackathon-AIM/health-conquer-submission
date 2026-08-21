@@ -1,0 +1,18 @@
+.git
+.gitignore
+.env
+.env.*
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+README.md
+
+# 준비 저장소에서 코드를 옮겨올 때 같이 딸려오기 쉬운 것들.
+# 빌드 컨텍스트가 부풀면 5분 제한에 걸린다.
+*.pdf
+results/
+fixtures/
+healthbench_data/
+vendor/
+.cache/
