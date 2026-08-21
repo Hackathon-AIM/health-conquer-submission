@@ -74,6 +74,7 @@ MCP_CONCURRENCY = int(os.environ.get("MCP_CONCURRENCY", "12"))
 #   thinking off → reasoning 0자    + content 576자, finish=stop     (완결, 395토큰)
 # 상한이 2048 로 묶여 있는 한, thinking 을 켜면 긴 답변은 구조적으로 완결될 수 없다.
 ENABLE_THINKING = os.environ.get("FM_THINKING", "0") == "1"
+ANSWER_WORD_TARGET = os.environ.get("ANSWER_WORD_TARGET", "120-250").strip() or "120-250"
 
 # L2 follows task instructions in the latest user turn more reliably than a
 # separate system message. Keep this deliberately narrow: it prevents a generic
@@ -83,7 +84,7 @@ ANSWER_INSTRUCTION = (
     "Silently check the key medical reasoning, missing assumptions, and any relevant red flags before "
     "writing, but do not reveal hidden reasoning. Be concise but complete: include the direct answer, "
     "the key reason, relevant distinctions or risk groups, practical next steps, and specific warning "
-    "signs or follow-up conditions when they matter. Aim for 120-250 words unless the user asks for "
+    f"signs or follow-up conditions when they matter. Aim for {ANSWER_WORD_TARGET} words unless the user asks for "
     "more detail. Use short bullets when the user asks multiple things or the answer has several "
     "categories, but keep the total list compact. Do not use emoji. "
     "If the latest user message is a fragment, keyword list, ambiguous scenario, or missing the actual "
