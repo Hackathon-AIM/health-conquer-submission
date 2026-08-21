@@ -77,7 +77,9 @@ ENABLE_THINKING = os.environ.get("FM_THINKING", "0") == "1"
 # separate system message. Keep this deliberately narrow: it prevents a generic
 # referral from replacing an otherwise answerable medical response.
 ANSWER_INSTRUCTION = (
-    "Do not substitute 'consult a professional' for an answer; answer as far as you can."
+    "Do not substitute 'consult a professional' for an answer; answer as far as you can. "
+    "If what is described could be an emergency, say that first and state what to do "
+    "right now, before any other explanation."
 )
 
 _fm_sem = asyncio.Semaphore(FM_CONCURRENCY)
