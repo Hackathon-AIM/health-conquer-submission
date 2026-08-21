@@ -131,8 +131,12 @@ ROUTE_SCHEMA: dict[str, Any] = {
         "persona": {"type": "string", "enum": ["layperson", "practitioner", "clinician"]},
         "lang": {"type": "string", "enum": ["ko", "en"]},
         "date_sensitive": {"type": "boolean"},
+        "search_query": {"type": "string"},
     },
-    "required": ["domain", "urgency", "context", "ask_back", "persona", "lang", "date_sensitive"],
+    "required": [
+        "domain", "urgency", "context", "ask_back",
+        "persona", "lang", "date_sensitive", "search_query",
+    ],
     "additionalProperties": False,
 }
 
@@ -151,6 +155,9 @@ class Route:
     lang: str = "ko"
     ask_back: str = ""  # context=missing_critical 일 때 되물을 문장 하나
     date_sensitive: bool = False  # 날짜가 박힌 질문이면 effective_date 대조가 필요하다
+    # 멀티턴 지시대명사를 푼 self-contained 검색 질의. 라우터가 여기서 만들어 두면
+    # generation 단계에서 "모델에게 도구를 줘서 질의를 받아오는" 왕복 한 번이 통째로 없어진다.
+    search_query: str = ""
     tools: list[str] = field(default_factory=list)
     source: str = "llm"  # llm | rules | fallback
 
@@ -210,7 +217,13 @@ Return ONLY a JSON object, no prose, with these keys:
 "date_sensitive": true if the question is pinned to a specific date or asks whether a rule is
   still current.
 
-Question:
+"search_query": a single self-contained query to look the answer up with. Resolve every pronoun
+  and ellipsis from the conversation ("그 약" → the actual drug name). Be specific and descriptive
+  rather than a few keywords. For the guideline/HIRA corpora an English query works well even
+  when the user wrote Korean; for Korean law and Korean drug/billing lookups keep Korean terms.
+  Empty string only when domain is "generic".
+
+Conversation (most recent user turn last):
 {question}"""
 
 
@@ -233,6 +246,16 @@ def last_user_text(messages: list[dict]) -> str:
     return ""
 
 
+def transcript(messages: list[dict], turns: int = 5, per_turn: int = 700) -> str:
+    """최근 대화를 라우터에 보여줄 형태로. 지시대명사를 풀려면 앞 턴이 필요하다."""
+    tail = [m for m in messages if m.get("role") in ("user", "assistant")][-turns:]
+    lines = []
+    for m in tail:
+        who = "User" if m.get("role") == "user" else "Assistant"
+        lines.append(f"{who}: {str(m.get('content') or '')[:per_turn]}")
+    return "\n".join(lines)
+
+
 def build_route(raw: dict[str, Any] | None, question: str, source: str) -> Route:
     raw = raw or {}
     r = Route(source=source)
@@ -251,6 +274,9 @@ def build_route(raw: dict[str, Any] | None, question: str, source: str) -> Route
 
     r.lang = "en" if str(raw.get("lang") or "").strip() == "en" else "ko"
     r.ask_back = str(raw.get("ask_back") or "").strip()
+    # 라우터가 질의를 못 만들었으면 마지막 사용자 발화를 그대로 쓴다. 지시대명사가
+    # 남아 있을 수 있지만, 검색을 통째로 건너뛰는 것보다는 낫다.
+    r.search_query = str(raw.get("search_query") or "").strip() or question
     # 규칙이 잡으면 올린다. LLM 이 놓치는 쪽이 실측에서 확인됐다.
     r.date_sensitive = bool(raw.get("date_sensitive")) or rule_date_sensitive(question)
 
@@ -288,8 +314,8 @@ async def classify(messages: list[dict], call_fm) -> Route:
 
     try:
         data = await call_fm(
-            [{"role": "user", "content": CLASSIFY_PROMPT.format(question=question)}],
-            384,
+            [{"role": "user", "content": CLASSIFY_PROMPT.format(question=transcript(messages))}],
+            512,
             {"response_format": ROUTE_RESPONSE_FORMAT},
         )
         content = data["choices"][0]["message"].get("content") or ""

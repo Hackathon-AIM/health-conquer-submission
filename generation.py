@@ -10,11 +10,10 @@ memory 로 답하거나, 그 도구를 불러 근거를 받아 답한다.
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any
 
-from retrieval import RETRIEVE_TOOL, RetrievalResult, run_retrieval
+from retrieval import RetrievalResult, run_retrieval
 
 log = logging.getLogger("generation")
 
@@ -88,63 +87,53 @@ async def generate(
     mcp,
     max_tokens: int,
     budget: int = 6,
+    deadline=None,
+    reserve: float = 25.0,
 ) -> tuple[str, RetrievalResult | None]:
     """generation 단계를 돌린다. 모델이 도구를 부르면 그 안에서 retrieval 을 실행한다."""
     convo: list[dict] = [{"role": "system", "content": generation_system(route)}]
     convo.extend(messages)
 
-    # 검색할 도구가 없는 도메인(generic)이면 도구를 아예 주지 않는다.
+    # 검색할 게 없는 도메인(generic)이면 그대로 답한다.
+    if not route.tools:
+        data = await call_fm(convo, max_tokens)
+        return (data["choices"][0]["message"].get("content") or "").strip(), None
+
+    # 원래는 여기서 모델에게 retrieve_relevant_content 를 주고, 모델이 질의를 만들어
+    # 호출해 오기를 기다렸다. 그 왕복이 FM 호출을 한 번 더 썼고, 요청당 호출 수가
+    # 곧 지연이라 통째로 걷어냈다. 라우터가 이미 self-contained 질의를 만들어 둔다.
     #
-    # 도구를 주기만 하면 L2 는 그냥 자기 지식으로 답해 버린다 — 그것도 [1] 같은 인용을
-    # 붙여서. 실측으로 확인했다. 근거 없는 인용은 정확성 축에 그대로 손해라서,
-    # 라우터가 "검색이 필요한 도메인"이라고 판정했으면 호출을 강제한다.
-    extra: dict[str, Any] | None = None
-    if route.tools:
-        extra = {
-            "tools": [RETRIEVE_TOOL],
-            "tool_choice": {
-                "type": "function",
-                "function": {"name": RETRIEVE_TOOL["function"]["name"]},
-            },
-        }
+    # (도구를 주기만 하면 L2 가 검색을 건너뛰고 [1] 인용을 지어내던 문제도 같이 사라진다.
+    #  이제 검색 여부는 모델이 아니라 라우터가 정한다.)
+    query = (route.search_query or "").strip() or _last_user(messages)
+    result = await run_retrieval(
+        query, route.tools, call_fm, mcp, budget=budget,
+        deadline=deadline, reserve=reserve,
+    )
+    log.info(
+        "retrieval: status=%s items=%d calls=%d q=%r",
+        result.status, len(result.items), result.tool_calls_used, query[:80],
+    )
 
-    data = await call_fm(convo, max_tokens, extra)
-    choice = data["choices"][0]
-    msg = choice["message"]
-    calls = msg.get("tool_calls") or []
-
-    if not calls:
-        return (msg.get("content") or "").strip(), None
-
-    # 모델이 근거가 필요하다고 판단했다. retrieval 단계를 돌려 돌려준다.
-    convo.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": calls})
-    result: RetrievalResult | None = None
-
-    for tc in calls:
-        fn = (tc.get("function") or {}).get("name") or ""
-        raw = (tc.get("function") or {}).get("arguments") or "{}"
-        try:
-            args = json.loads(raw) if isinstance(raw, str) else dict(raw)
-        except json.JSONDecodeError:
-            args = {}
-        query = str(args.get("query") or "").strip()
-
-        if fn != RETRIEVE_TOOL["function"]["name"] or not query:
-            convo.append(
-                {"role": "tool", "tool_call_id": tc.get("id") or "", "content": "{}"}
-            )
-            continue
-
-        result = await run_retrieval(query, route.tools, call_fm, mcp, budget=budget)
-        log.info(
-            "retrieval: status=%s items=%d calls=%d q=%r",
-            result.status, len(result.items), result.tool_calls_used, query[:80],
-        )
-        convo.append(
-            {"role": "tool", "tool_call_id": tc.get("id") or "", "content": result.as_prompt()}
-        )
-
-    # 근거를 받은 상태로 다시 답을 만든다. 이번엔 도구를 주지 않는다 — 답을 쓸 차례다.
-    data2 = await call_fm(convo, max_tokens)
-    content = (data2["choices"][0]["message"].get("content") or "").strip()
+    # 근거는 마지막 사용자 발화 바로 앞에 끼워 넣는다. tool 메시지로 주려면
+    # tool_call_id 짝을 맞춰야 하는데, 평범한 컨텍스트로 줘도 모델은 똑같이 읽는다.
+    convo.insert(
+        max(1, len(convo) - 1),
+        {
+            "role": "system",
+            "content": (
+                "Retrieved evidence for this question. Cite these as [1], [2] and cite "
+                "nothing else. If they do not answer it, say so.\n\n" + result.as_prompt()
+            ),
+        },
+    )
+    data = await call_fm(convo, max_tokens)
+    content = (data["choices"][0]["message"].get("content") or "").strip()
     return content, result
+
+
+def _last_user(messages: list[dict]) -> str:
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            return str(m.get("content") or "")
+    return ""
