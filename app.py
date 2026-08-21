@@ -428,6 +428,12 @@ async def _draft_harness(messages: list[dict], dl: Deadline) -> tuple[str, str, 
 
     # 응급이면 검색을 짧게 끊는다. 응급에서 값을 내는 건 근거 인용이 아니라 즉시 의뢰다.
     budget = EMERGENCY_BUDGET if route.urgency == "emergency" else RETRIEVAL_BUDGET
+    # 체인이 필요한 도메인은 그 홉 수를 못 채우면 근거를 하나도 못 얻는다.
+    # 법령: search → list_articles → get_article 이라야 조문 전문이 나온다.
+    if route.urgency != "emergency" and route.min_hops > budget:
+        log.info("도메인 %s 는 최소 %d홉 — 예산을 %d에서 올린다",
+                 route.domain, route.min_hops, budget)
+        budget = route.min_hops
 
     # 검색은 답을 쓸 시간과 검증할 시간을 둘 다 남기고 멈춰야 한다.
     content, retr = await generate(

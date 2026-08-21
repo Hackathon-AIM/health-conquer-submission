@@ -74,6 +74,23 @@ DOMAIN_TOOLS: dict[str, list[str]] = {
 }
 DOMAINS = list(DOMAIN_TOOLS)
 
+# ── 도메인별 최소 도구 호출 수 ────────────────────────────────
+#
+# 어떤 도메인은 한 번으로 끝나고 어떤 도메인은 체인이다. 법령이 대표적이다:
+#   openapi_law_search        법령명 → MST            (근거 아님)
+#   openapi_law_list_articles MST → 조문키            (근거 아님)
+#   openapi_law_get_article   조문키 → 조문 전문      (여기부터 근거다)
+# 근거 하나를 얻는 데 3홉이 든다. 예산 3 이면 한 번만 헛돌아도 답이 없다.
+#
+# 실측: 법령 문항에서 모델이 law_search 를 네 번 부르다 예산을 태웠고,
+# 답변은 근거 없이 기억에서 나온 38자였다.
+# guideline/hira 인덱스도 2홉이다 (relevant_nodes → get_page_content).
+DOMAIN_MIN_HOPS: dict[str, int] = {
+    "korean_law": 4,
+    "guideline_index": 3,
+    "hira_updates": 3,
+}
+
 # ── 응급 규칙 (recall 우선) ────────────────────────────────────────────
 # 단독으로 응급인 것.
 EMERGENCY_SOLO = [
@@ -184,6 +201,8 @@ class Route:
     drug_en: str = ""
 
     tools: list[str] = field(default_factory=list)
+    # 이 도메인이 근거 하나를 얻는 데 필요한 최소 도구 호출 수.
+    min_hops: int = 0
     source: str = "llm"  # llm | rules | fallback
 
     def as_dict(self) -> dict[str, Any]:
@@ -358,6 +377,7 @@ def build_route(raw: dict[str, Any] | None, question: str, source: str) -> Route
         r.ask_back = ""
 
     r.tools = list(DOMAIN_TOOLS[r.domain])
+    r.min_hops = DOMAIN_MIN_HOPS.get(r.domain, 0)
 
     # 날짜가 박힌 질문은 "지금도 그런가"를 묻는 것이다. 개정 이력을 볼 수 있어야
     # effective_date 와 대조해 "그때 적용된 규칙이 아니다"를 말할 수 있다.

@@ -244,6 +244,66 @@ def test_unfixable_call_is_skipped_without_spending_budget() -> None:
     assert res.tool_calls_used == 0, "예산을 태웠다"
 
 
+# ── 헛도는 도구 차단 · 체인 도메인 예산 ───────────────────────
+class BarrenMCP(FakeMCP):
+    """근거(cite_uid)를 하나도 안 주는 도구. 법령 검색이 실제로 이렇다."""
+
+    async def list_tools(self, timeout=None):
+        self.list_timeout = timeout
+        return [
+            {"name": n, "description": n, "inputSchema": {"type": "object", "properties": {}}}
+            for n in ("openapi_law_search", "openapi_law_list_articles")
+        ]
+
+    async def call_tool(self, name, arguments, timeout=None):
+        self.calls.append((name, dict(arguments)))
+        return {"items": [], "message": "3 law match. Open one with openapi_law_list_articles(mst)."}
+
+
+def test_a_tool_that_yields_no_evidence_is_closed_after_two_tries() -> None:
+    """실측: 법령 문항에서 law_search 를 네 번 불러 예산을 태우고 답을 못 냈다.
+
+    인자를 조금씩 바꾸면 중복 제거로는 못 막는다. 성과로 막아야 한다.
+    """
+    tcs = [
+        _tc(1, "openapi_law_search", {"query": "국민건강보험법"}),
+        _tc(2, "openapi_law_search", {"query": "국민건강보험"}),
+        _tc(3, "openapi_law_search", {"query": "건강보험법"}),
+        _tc(4, "openapi_law_search", {"query": "국민건강보험법 시행령"}),
+    ]
+    fm = ScriptedFM([{"choices": [{"message": {"content": "", "tool_calls": tcs}}]}])
+    mcp = BarrenMCP()
+    ctx = {"query_ko": "국민건강보험법 이의신청 조항", "query_en": "appeal article"}
+    res = asyncio.run(
+        run_retrieval("q", ["openapi_law_search"], fm, mcp, budget=6, ctx=ctx)
+    )
+    assert len(mcp.calls) == 2, f"{len(mcp.calls)}번 불렀다 — 두 번이면 닫아야 한다"
+    assert any("새 근거를 못 냈다" in t for t in res.trace), res.trace
+
+
+def test_a_productive_tool_is_not_closed() -> None:
+    """근거를 내는 도구는 계속 쓸 수 있어야 한다."""
+    tcs = [_tc(i, "adr_retrieve_drug_info", {"drug_name": f"drug{i}"}) for i in (1, 2, 3)]
+    fm = ScriptedFM([{"choices": [{"message": {"content": "", "tool_calls": tcs}}]}])
+    mcp = FakeMCP()
+    res = asyncio.run(
+        run_retrieval("q", ["adr_retrieve_drug_info"], fm, mcp, budget=6, ctx=CTX)
+    )
+    assert len(mcp.calls) == 3, f"{len(mcp.calls)}번만 불렀다"
+
+
+def test_chain_domains_get_a_bigger_hop_budget() -> None:
+    """법령은 근거 하나에 3홉이 든다. 예산 3 이면 한 번만 헛돌아도 답이 없다."""
+    from router import DOMAIN_MIN_HOPS, build_route
+
+    r = build_route({"domain": "korean_law"}, "국민건강보험법 이의신청", source="llm")
+    assert r.min_hops >= 3, r.min_hops
+    assert DOMAIN_MIN_HOPS["korean_law"] > DOMAIN_MIN_HOPS.get("mfds", 0)
+
+    plain = build_route({"domain": "mfds"}, "타이레놀 허가", source="llm")
+    assert plain.min_hops == 0, "체인이 아닌 도메인까지 예산을 올리면 안 된다"
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0

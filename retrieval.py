@@ -81,6 +81,16 @@ def tool_cap(name: str) -> float:
 DESC_LIMIT = 900
 
 FINALIZE = "finalize_retrieval"
+
+# 근거를 하나도 못 낸 도구 결과 꼬리에 붙인다. 그 결과는 대개 "다음 도구를
+# 이렇게 불러라" 를 담고 있는데(법령 검색의 mst, 인덱스의 doc_id·page range),
+# 큰 JSON 안에 묻히면 모델이 같은 도구를 반복한다.
+NEXT_STEP_HINT = (
+    "\n\n[NOTE: this call returned no citable evidence. It is a lookup step. "
+    "Read the result for an identifier or a named follow-up tool (for example an "
+    "mst, a doc_id with a page range, or a suggested tool) and call THAT next. "
+    "Do not call this same tool again.]"
+)
 FINALIZE_TOOL: dict[str, Any] = {
     "type": "function",
     "function": {
@@ -246,6 +256,44 @@ def to_openai_tools(mcp_tools: list[dict], names: list[str]) -> list[dict]:
     return out
 
 
+# 근거 항목의 배관 필드. 답에 쓰이지 않으므로 본문에서 뺀다.
+_PLUMBING = {
+    "cite_uid", "source_id", "tool_result_type", "layer", "url", "source_url",
+    "source_type", "title", "doc_title", "relevance_score", "row_key", "case_id",
+    "node_id", "doc_id", "provider", "ancestors", "range", "specialty",
+    "doc_url", "source_version", "match_type", "is_headword", "revision",
+}
+
+
+def _render_fields(payload: dict) -> str:
+    """타입 필드를 본문으로 편다.
+
+    openapi 계열 도구는 자유 텍스트 필드를 주지 않는다. 답은 타입 필드에 있다.
+    실측:
+        openapi_mfds_get_drug_indication  indication · ingredient_eng · atc_code
+        openapi_hira_get_drug_price       max_price · pay_type · effective_date
+        openapi_hira_disease_check_code   kor_name · usable_as_primary
+        kcd_search_codes                  code · kor · eng
+    이걸 못 펴면 수확은 되는데 본문이 0자인 근거가 만들어지고, 모델은 아무것도
+    없는 [1] 을 인용하라는 지시를 받는다. 약값·허가·코드 질문이 통째로 이 상태였다.
+    """
+    lines: list[str] = []
+    for k, v in payload.items():
+        if k in _PLUMBING:
+            continue
+        if v is None or v == "" or v == [] or v == {}:
+            continue
+        if isinstance(v, (dict, list)):
+            rendered = json.dumps(v, ensure_ascii=False)
+            if len(rendered) > 600:
+                # 큰 구조는 본문 후보에서 이미 걸러졌거나 배관이다.
+                continue
+        else:
+            rendered = str(v)
+        lines.append(f"{k}: {rendered}")
+    return "\n".join(lines)
+
+
 def _harvest(payload: Any, out: dict[str, Evidence]) -> None:
     """도구 결과 어디에 있든 cite_uid 를 가진 것을 주워 담는다.
 
@@ -280,6 +328,9 @@ def _harvest(payload: Any, out: dict[str, Evidence]) -> None:
                 if v:
                     text = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
                     break
+        if not text:
+            # 자유 텍스트가 없는 도구다. 타입 필드를 펴서 본문으로 만든다.
+            text = _render_fields(payload)
         prev = out.get(uid)
         if prev is None or (len(text) > len(prev.text)):
             out[uid] = Evidence(
@@ -340,6 +391,12 @@ async def run_retrieval(
     # 같은 요청 안에서 같은 호출을 두 번 하지 않는다. 모델이 같은 도구를 조금씩
     # 다른 표현으로 반복해 부르는 것을 실측에서 봤고, 그건 예산만 태운다.
     done: set[str] = set()
+    # 인자만 살짝 바꿔 같은 도구를 반복하는 것은 위 dedup 으로 못 막는다.
+    # 실측: 법령 문항에서 openapi_law_search 를 네 번 불러 예산을 태웠고,
+    # 정작 조문 전문을 주는 get_article 까지 가지 못했다.
+    # 그래서 새 근거를 못 낸 횟수를 도구별로 세고, 두 번이면 그 도구를 닫는다.
+    barren: dict[str, int] = {}
+    closed: set[str] = set()
 
     # budget 은 **실제 MCP 도구 호출 수**다. 예전에는 이 값이 FM 왕복 수였고,
     # 모델이 한 스텝에 도구를 3개 부르면 예산 3에 9번이 나갔다. 이름과 주석은
@@ -418,6 +475,8 @@ async def run_retrieval(
             key = call_key(fn, args)
             if not skip and key in done:
                 skip = "같은 인자로 이미 불렀다"
+            if not skip and fn in closed:
+                skip = f"{fn} 은 새 근거를 못 냈다 — 다른 도구를 쓰거나 끝내라"
 
             out_of_budget = res.tool_calls_used >= budget
             out_of_time = deadline is not None and deadline.expired(reserve=reserve)
@@ -439,6 +498,7 @@ async def run_retrieval(
             res.tool_calls_used += 1
             done.add(key)
             res.trace.append(f"{fn}({json.dumps(args, ensure_ascii=False)[:120]})")
+            before_n = len(harvested)
             try:
                 payload = await mcp.call_tool(
                     fn, args, timeout=call_cap(deadline, tool_cap(fn), reserve=reserve)
@@ -448,6 +508,22 @@ async def run_retrieval(
             except Exception as e:  # noqa: BLE001 — 한 도구가 죽어도 계속 간다
                 log.warning("도구 %s 실패: %s", fn, str(e)[:200])
                 content = json.dumps({"error": str(e)[:300]}, ensure_ascii=False)
+
+            if len(harvested) == before_n:
+                # 이 호출은 새 근거를 하나도 못 냈다. 탐색용 호출일 수 있으니
+                # 한 번은 봐주고, 두 번째부터 그 도구를 닫는다.
+                barren[fn] = barren.get(fn, 0) + 1
+                if barren[fn] >= 2:
+                    closed.add(fn)
+                    log.info("%s 닫음 — 두 번 불렀는데 새 근거가 없었다", fn)
+                # 탐색용 도구는 결과 안에 "다음엔 이걸 불러라" 를 적어 준다.
+                # 그런데 그 문장이 큰 JSON 안에 묻히면 모델이 그냥 같은 도구를
+                # 또 부른다 — 실측에서 법령 검색이 정확히 그랬다. 그래서 꼬리에
+                # 한 줄로 못박는다. 특정 도구를 아는 코드가 아니라, 근거가 0인
+                # 모든 호출에 붙는 일반 규칙이다.
+                content += NEXT_STEP_HINT
+            else:
+                barren.pop(fn, None)
 
             messages.append(
                 {
@@ -459,6 +535,15 @@ async def run_retrieval(
 
         if finalized:
             break
+
+    # 본문이 없는 근거는 버린다. 인용 슬롯 하나가 빈 곳을 가리키는 것은
+    # 근거가 하나 적은 것보다 나쁘다 — 모델이 그 번호로 없는 내용을 인용한다.
+    blank = [uid for uid, ev in harvested.items() if not ev.text.strip()]
+    for uid in blank:
+        harvested.pop(uid, None)
+    if blank:
+        log.info("본문 없는 근거 %d건 제외", len(blank))
+    res.items = [ev for ev in res.items if ev.text.strip()]
 
     # finalize 를 안 부르고 예산을 태운 경우에도 주운 것은 쓴다.
     if not res.items and harvested:
