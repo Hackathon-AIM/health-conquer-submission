@@ -3,18 +3,21 @@
 평가자(Evaluator)가 각 대화 턴을 POST /v1/chat/completions 로 보내고,
 이 서버가 다음 assistant 응답을 돌려준다.
 
-지금은 L2 로 그대로 넘기는 최소 관통 버전이다.
-이 파일의 `generate_reply()` 안이 retrieval/generation 2단계 하네스로 바뀔 자리다.
+요청 하나의 흐름:
+  라우터가 도메인·응급도·맥락 충분성·페르소나를 정하고,
+  그 판정에 따라 되묻기 / 직답 / 검색-후-답변으로 갈린다.
 """
 
 import asyncio
 import logging
 import os
+from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
 from fastapi import FastAPI
 
+from budget import Deadline
 from generation import generate
 from mcp_client import MCPClient
 from router import classify
@@ -29,7 +32,7 @@ FM_MODEL = os.environ.get("LUNIT_FM_MODEL", "Lunit/L2-preview")
 # 서버가 max_tokens 2048 을 넘기면 400 (`output_limit_exceeded`) 을 던진다. 이건 상한이다.
 SERVER_MAX_TOKENS = 2048
 MAX_TOKENS = min(int(os.environ.get("FM_MAX_TOKENS", "2048")), SERVER_MAX_TOKENS)
-TIMEOUT = float(os.environ.get("FM_TIMEOUT", "180"))
+TIMEOUT = float(os.environ.get("FM_TIMEOUT", "120"))
 FM_RETRIES = int(os.environ.get("FM_RETRIES", "3"))
 FM_BACKOFF = float(os.environ.get("FM_BACKOFF", "1.5"))
 
@@ -37,32 +40,53 @@ FM_BACKOFF = float(os.environ.get("FM_BACKOFF", "1.5"))
 RETRIEVAL_BUDGET = int(os.environ.get("RETRIEVAL_BUDGET", "6"))
 EMERGENCY_BUDGET = int(os.environ.get("EMERGENCY_BUDGET", "2"))
 
-MCP = MCPClient()
+# 요청 하나에 쓸 수 있는 총 시간. 평가 하네스가 얼마나 기다려 주는지 모르니
+# 늦은 무응답을 피하는 쪽으로 잡는다. RESERVE 는 최종 답변 생성 몫으로 떼어 둔다.
+REQUEST_BUDGET_S = float(os.environ.get("REQUEST_BUDGET_S", "75"))
+ANSWER_RESERVE_S = float(os.environ.get("ANSWER_RESERVE_S", "25"))
+
+# 우리 스스로를 밀어내지 않도록 상류 호출을 조인다. 요청 하나가 FM 을 최대 9회,
+# MCP 를 6회까지 부르기 때문에 동시 요청이 몰리면 상류가 먼저 무너진다.
+FM_CONCURRENCY = int(os.environ.get("FM_CONCURRENCY", "8"))
+MCP_CONCURRENCY = int(os.environ.get("MCP_CONCURRENCY", "6"))
 
 # L2 는 사고과정을 별도 `reasoning` 필드로 뱉는데, 그게 2048 예산을 통째로 먹는다.
 # 실측(같은 질문):
 #   thinking on  → reasoning 2492자 + content 881자, finish=length  (잘림)
 #   thinking off → reasoning 0자    + content 576자, finish=stop     (완결, 395토큰)
 # 상한이 2048 로 묶여 있는 한, thinking 을 켜면 긴 답변은 구조적으로 완결될 수 없다.
-# 품질 A/B 는 따로 하되 기본값은 off 로 둔다.
 ENABLE_THINKING = os.environ.get("FM_THINKING", "0") == "1"
 
-app = FastAPI(title="AIM conversation driver")
+_fm_sem = asyncio.Semaphore(FM_CONCURRENCY)
+_client: httpx.AsyncClient | None = None
+MCP = MCPClient(concurrency=MCP_CONCURRENCY)
 
 
-@app.on_event("startup")
-async def announce() -> None:
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    # httpx 클라이언트를 요청마다 새로 만들면 연결이 재사용되지 않고, 장시간 대량
+    # 요청에서 소켓이 쌓인다. 하나를 띄워두고 공유한다.
+    global _client
+    _client = httpx.AsyncClient(
+        timeout=TIMEOUT,
+        limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
+    )
     # 키가 없어도 컨테이너는 뜬다 — "수동 작업 없이 시작" 요구사항 때문.
     # 대신 여기서 크게 남겨서 평가 로그만 봐도 원인을 알 수 있게 한다.
     if not FM_KEY:
         log.error("LUNIT_FM_API_KEY 가 비어 있다. 모든 생성 요청이 실패한다.")
     log.info(
-        "driver up — model=%s url=%s max_tokens=%d thinking=%s",
-        FM_MODEL,
-        FM_URL,
-        MAX_TOKENS,
-        ENABLE_THINKING,
+        "driver up — model=%s max_tokens=%d thinking=%s budget=%.0fs fm_conc=%d mcp_conc=%d",
+        FM_MODEL, MAX_TOKENS, ENABLE_THINKING, REQUEST_BUDGET_S, FM_CONCURRENCY, MCP_CONCURRENCY,
     )
+    try:
+        yield
+    finally:
+        await _client.aclose()
+        await MCP.aclose()
+
+
+app = FastAPI(title="AIM conversation driver", lifespan=lifespan)
 
 
 @app.get("/health")
@@ -94,11 +118,12 @@ async def call_fm(
         "chat_template_kwargs": {"enable_thinking": ENABLE_THINKING},
         **(extra or {}),
     }
+    assert _client is not None, "lifespan 이 클라이언트를 만들기 전에 호출됐다"
     last: Exception | None = None
     for attempt in range(FM_RETRIES):
         try:
-            async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-                r = await client.post(
+            async with _fm_sem:
+                r = await _client.post(
                     f"{FM_URL}/v1/chat/completions",
                     headers={"Authorization": f"Bearer {FM_KEY}"},
                     json=payload,
@@ -123,15 +148,7 @@ async def call_fm(
     raise last
 
 
-async def generate_reply(messages: list[dict]) -> str:
-    """대화 맥락을 받아 다음 assistant 발화를 만든다.
-
-    입구에서 라우터가 도메인·응급도·맥락 충분성·페르소나를 정하고, 그 판정에 따라
-    되묻기 / 직답 / 검색-후-답변으로 갈린다.
-
-    TODO: L2 는 single-turn 최적화라 멀티턴 히스토리를 self-contained 질의로
-    눌러주는 단계가 아직 없다.
-    """
+async def generate_reply(messages: list[dict], dl: Deadline) -> str:
     route = await classify(messages, call_fm)
     log.info(
         "route: domain=%s urgency=%s context=%s persona=%s date=%s src=%s tools=%d",
@@ -148,32 +165,41 @@ async def generate_reply(messages: list[dict]) -> str:
     # 정작 근거는 "약물 부작용 자료에서 확인되지 않음"이라 답에 보탬이 없었다.
     # 응급에서 값을 내는 건 근거 인용이 아니라 즉시 의뢰다.
     budget = EMERGENCY_BUDGET if route.urgency == "emergency" else RETRIEVAL_BUDGET
-    content, retr = await generate(messages, route, call_fm, MCP, MAX_TOKENS, budget)
+    content, _ = await generate(
+        messages, route, call_fm, MCP, MAX_TOKENS, budget, dl, ANSWER_RESERVE_S
+    )
 
     # content 가 비는 건 대개 reasoning 이 예산을 다 먹고 잘린 경우다.
-    # max_tokens 를 더 올릴 수는 없으므로(2048 이 상한), 한 번만 다시 시도한다.
-    # 조용히 빈 문자열을 흘리면 그 문항은 통째로 0점이 된다.
-    if not content:
-        log.warning("빈 content — 재시도")
+    # max_tokens 를 더 올릴 수는 없으므로(2048 이 상한), 시간이 남아 있을 때만 한 번 더 시도한다.
+    if not content and not dl.expired(reserve=5):
+        log.warning("빈 content — 재시도 (남은 %.0fs)", dl.remaining())
         data = await call_fm(messages, MAX_TOKENS)
         content = (data["choices"][0]["message"].get("content") or "").strip()
 
     if not content:
-        log.error("재시도 후에도 빈 content")
+        log.error("빈 content 로 응답한다 — elapsed=%.1fs", dl.elapsed)
     return content
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(body: dict) -> dict[str, Any]:
     messages = body.get("messages") or []
+    dl = Deadline.start(REQUEST_BUDGET_S)
     try:
-        content = await generate_reply(messages)
+        # 단계마다 남은 시간을 보며 스스로 줄이지만, 그래도 넘기면 여기서 끊는다.
+        content = await asyncio.wait_for(
+            generate_reply(messages, dl), timeout=REQUEST_BUDGET_S + 15
+        )
+    except asyncio.TimeoutError:
+        log.error("요청 시간 초과 — elapsed=%.1fs", dl.elapsed)
+        content = ""
     except Exception:
         # 평가 하네스에 5xx 를 돌려주면 대화 전체가 깨질 수 있다.
         # 그래서 형식은 지키되, 실패는 로그에 남겨 사후에 반드시 보이게 한다.
         log.exception("생성 실패")
         content = ""
 
+    log.info("응답 %d자 / %.1fs", len(content), dl.elapsed)
     return {
         "object": "chat.completion",
         "model": FM_MODEL,

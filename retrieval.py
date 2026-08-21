@@ -213,8 +213,14 @@ async def run_retrieval(
     mcp,
     budget: int = 6,
     step_tokens: int = 900,
+    deadline=None,
+    reserve: float = 25.0,
 ) -> RetrievalResult:
-    """retrieval 단계 — 도구를 돌려 근거를 모으고 cite_uid 를 확정한다."""
+    """retrieval 단계 — 도구를 돌려 근거를 모으고 cite_uid 를 확정한다.
+
+    `deadline` 을 주면 남은 시간을 보며 스스로 멈춘다. 답을 쓸 시간(`reserve`)은
+    반드시 남긴다 — 근거를 더 모으다 답을 못 쓰면 그 문항은 0점이다.
+    """
     res = RetrievalResult()
     if not tool_names:
         res.status = "no_evidence"
@@ -239,6 +245,10 @@ async def run_retrieval(
     harvested: dict[str, Evidence] = {}
 
     for _ in range(budget):
+        if deadline is not None and deadline.expired(reserve=reserve):
+            log.info("시간 예산으로 retrieval 조기 종료 (남은 %.0fs)", deadline.remaining())
+            res.note = (res.note + " " if res.note else "") + "retrieval cut short by time budget"
+            break
         try:
             data = await call_fm(messages, step_tokens, {"tools": tools})
         except Exception as e:  # noqa: BLE001

@@ -88,6 +88,8 @@ async def generate(
     mcp,
     max_tokens: int,
     budget: int = 6,
+    deadline=None,
+    reserve: float = 25.0,
 ) -> tuple[str, RetrievalResult | None]:
     """generation 단계를 돌린다. 모델이 도구를 부르면 그 안에서 retrieval 을 실행한다."""
     convo: list[dict] = [{"role": "system", "content": generation_system(route)}]
@@ -135,7 +137,10 @@ async def generate(
             )
             continue
 
-        result = await run_retrieval(query, route.tools, call_fm, mcp, budget=budget)
+        result = await run_retrieval(
+            query, route.tools, call_fm, mcp, budget=budget,
+            deadline=deadline, reserve=reserve,
+        )
         log.info(
             "retrieval: status=%s items=%d calls=%d q=%r",
             result.status, len(result.items), result.tool_calls_used, query[:80],

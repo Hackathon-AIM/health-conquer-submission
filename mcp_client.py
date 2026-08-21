@@ -42,11 +42,20 @@ def _parse_sse(text: str) -> dict[str, Any] | None:
 
 
 class MCPClient:
-    def __init__(self, url: str = MCP_URL, key: str = MCP_KEY) -> None:
+    def __init__(self, url: str = MCP_URL, key: str = MCP_KEY, concurrency: int = 6) -> None:
         self.url = url
         self.key = key
         self._tools: list[dict] | None = None
         self._lock = asyncio.Lock()
+        # 연결을 재사용한다. 호출마다 새 클라이언트를 만들면 소켓이 쌓인다.
+        self._client = httpx.AsyncClient(
+            timeout=MCP_TIMEOUT,
+            limits=httpx.Limits(max_connections=24, max_keepalive_connections=12),
+        )
+        self._sem = asyncio.Semaphore(concurrency)
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
 
     async def _rpc(self, method: str, params: dict | None = None) -> dict[str, Any]:
         body = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}}
@@ -58,8 +67,8 @@ class MCPClient:
         last: Exception | None = None
         for attempt in range(MCP_RETRIES):
             try:
-                async with httpx.AsyncClient(timeout=MCP_TIMEOUT) as c:
-                    r = await c.post(self.url, headers=headers, json=body)
+                async with self._sem:
+                    r = await self._client.post(self.url, headers=headers, json=body)
                 if r.status_code == 200:
                     parsed = _parse_sse(r.text)
                     if parsed is None:
