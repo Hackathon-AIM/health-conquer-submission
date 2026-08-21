@@ -12,7 +12,9 @@ README.md
 # 빌드 컨텍스트가 부풀면 5분 제한에 걸린다.
 *.pdf
 results/
+runs/
 fixtures/
+evals/
 healthbench_data/
 vendor/
 .cache/
