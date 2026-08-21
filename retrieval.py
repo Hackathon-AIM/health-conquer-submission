@@ -68,7 +68,12 @@ TOOL_RESULT_CHARS = int(os.environ.get("TOOL_RESULT_CHARS", "6000"))
 
 # generation 단계에 넘길 근거 블록의 총량. 항목 수가 아니라 글자 수로 막는다 —
 # 항목 하나가 20페이지 원문일 수도 있기 때문이다.
-EVIDENCE_BUDGET_CHARS = int(os.environ.get("EVIDENCE_BUDGET_CHARS", "4000"))
+# 실측이 뒤집은 값이다. 4,000자일 때 27,031자 문서에서 답이 통째로 사라졌다
+# (PSA 34회→0 · Gleason 17회→0 · 10 ng/mL 2회→0). 같은 문서·같은 점수함수로
+# 12,000자를 주면 그 신호가 전부 살아남는다 — 호출 0회, 추가 지연 0.
+# 게이트웨이 입력 상한은 ~400KB 라 자리는 남는다. 대가는 prefill 지연과
+# thinking 몫이므로 무한정 키우지는 않는다.
+EVIDENCE_BUDGET_CHARS = int(os.environ.get("EVIDENCE_BUDGET_CHARS", "12000"))
 
 # FM 왕복 상한. 도구 호출 예산과 별개로, 모델이 도구를 안 부르고 맴돌 때를 끊는다.
 RETRIEVAL_MAX_STEPS = int(os.environ.get("RETRIEVAL_MAX_STEPS", "4"))

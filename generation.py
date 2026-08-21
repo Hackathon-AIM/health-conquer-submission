@@ -46,6 +46,10 @@ from retrieval import (
 # 프롬프트 문구를 강화해도 system 채널은 0/5 였다. 채널의 문제였다.
 EVIDENCE_CHANNEL = os.environ.get("EVIDENCE_CHANNEL", "tool").strip().lower()
 
+# 요약본을 담을 예산. 추출(EVIDENCE_BUDGET_CHARS=4000)보다 크게 잡는다 —
+# 추출은 버려서 줄이고 요약은 줄여서 담는 것이라, 같은 예산이면 요약할 이유가 없다.
+DIGEST_BUDGET_CHARS = int(os.environ.get("DIGEST_BUDGET_CHARS", "12000"))
+
 log = logging.getLogger("generation")
 
 _PERSONA = {
@@ -195,10 +199,14 @@ async def generate(
     if DIGEST_MODE != "off" and result.items:
         try:
             head = len(result.status) + len(result.note) + 16
+            # 요약본은 추출본보다 넉넉한 예산을 쓴다. 추출은 버려서 줄이지만
+            # 요약은 줄여서 담는 것이라, 같은 예산이면 요약의 이점이 사라진다.
+            # 게이트웨이 입력 상한은 ~400KB 라 자리는 남는다. 대가는 지연과
+            # thinking 몫이고, 그건 DIGEST_BUDGET_CHARS 로 조절한다.
             packed, n_calls = await digest(
                 result.items,
                 query,
-                budget=max(0, EVIDENCE_BUDGET_CHARS - head),
+                budget=max(0, DIGEST_BUDGET_CHARS - head),
                 call_fm=call_fm,
                 deadline=deadline,
             )

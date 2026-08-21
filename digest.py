@@ -47,27 +47,56 @@ from compress import pack, prune_text
 log = logging.getLogger("digest")
 
 # off | auto
+#
+# 기본은 off 다. 한때 auto 로 뒀었는데, 그 판단의 근거였던 "추출이 답을 버린다"
+# 가 예산 4,000자에서만 참이었다. 예산을 12,000자로 올리고 다시 재보니:
+#
+#   원문 27,031자 (예산의 2.3배)
+#     추출만    12,233자 · 호출 0회 · 0.0초 · 놓친 신호 1개
+#     전량요약   5,382자 · 호출 9회 · 9.9초 · 놓친 신호 1개
+#   원문 58,862자 (예산의 4.9배)
+#     추출만    12,707자 · 호출 0회 · 0.0초 · 놓친 신호 없음
+#     전량요약  23,200자 · 호출 16회 · 8.4초 · 놓친 신호 없음
+#
+# 추출이 원문을 그대로 남기면서 공짜다. 요약은 더 조밀한 표현을 만들지만
+# 이 문서들에서는 그게 점수로 이어진다는 증거가 없다. 켜는 것은 A/B 이후다.
 DIGEST_MODE = os.environ.get("DIGEST_MODE", "off").strip().lower()
 
-# map | refine — 위 docstring 의 트레이드오프 참고.
-# 기본은 map 이다. 벽시계가 호출 하나분이라 우리 40초 예산 안에서도 돌기 때문이고,
-# refine 이 더 낫다는 근거는 아직 이 프로젝트에서 측정된 적이 없다.
+# map | refine — map 은 청크를 동시에, refine 은 앞 요약을 보며 순차로.
 DIGEST_STRATEGY = os.environ.get("DIGEST_STRATEGY", "map").strip().lower()
 
-# 원문 총량이 이보다 작으면 요약할 이유가 없다. 추출로 충분하다.
+# 요약을 돌릴 조건은 절대 크기가 아니라 **예산 대비 크기**다.
 #
-# 처음에는 "추출 결과가 예산 대비 몇 배인가" 로도 막으려 했는데 그건 성립하지
-# 않는다 — pack() 은 언제나 예산 이하를 돌려주므로 그 비율은 항상 1 이하다.
-# 추출이 잘 됐는지는 읽어보지 않고는 알 수 없다. 그래서 크기·시간·호출수만 본다.
-DIGEST_MIN_CHARS = int(os.environ.get("DIGEST_MIN_CHARS", "20000"))
+# 실측이 이걸 가르쳤다. 같은 27,031자 문서·같은 질의로:
+#   예산  4,000자 · 추출만 → 답이 전멸 (PSA·Gleason·10 ng/mL 전부 0)
+#   예산 12,000자 · 추출만 → 그 신호가 전부 살아남음 · 호출 0회 · 0.0초
+#   예산 12,000자 · 전량요약 → 5,382자로 더 조밀하지만 호출 9회 · 9.9초
+# 즉 예산이 충분하면 추출이 이긴다. 원문 그대로이고 공짜다.
+# 요약이 값을 내는 구간은 **원문이 예산보다 훨씬 클 때** 뿐이다.
+DIGEST_TRIGGER_MULT = float(os.environ.get("DIGEST_TRIGGER_MULT", "2.0"))
+# 그래도 이 크기 밑이면 굳이 부르지 않는다.
+DIGEST_MIN_CHARS = int(os.environ.get("DIGEST_MIN_CHARS", "12000"))
 # 남은 시간이 이보다 적으면 시작하지 않는다.
-DIGEST_MIN_S = float(os.environ.get("DIGEST_MIN_S", "12"))
-# map 호출 하나에 걸 상한과 개수 상한. 개수를 막지 않으면 100페이지짜리가 오면
-# 호출이 십수 개로 늘고, 그 순간 상류가 우리 때문에 밀린다.
-DIGEST_CALL_CAP_S = float(os.environ.get("DIGEST_CALL_CAP_S", "10"))
-DIGEST_MAX_CALLS = int(os.environ.get("DIGEST_MAX_CALLS", "4"))
-DIGEST_CHUNK_CHARS = int(os.environ.get("DIGEST_CHUNK_CHARS", "6000"))
-DIGEST_OUT_TOKENS = int(os.environ.get("DIGEST_OUT_TOKENS", "400"))
+DIGEST_MIN_S = float(os.environ.get("DIGEST_MIN_S", "10"))
+
+# ── 커버리지 ─────────────────────────────────────────────────
+#
+# 목표는 **원문 전체를 덮는 것**이다. 예전 상한 4청크는 27,031자 문서의 80% 만
+# 덮었고, 못 덮은 조각은 추출식으로 떨어져 대부분 버려졌다.
+#
+# 청크를 작게 잡을수록 요약이 촘촘해지지만 호출이 늘어난다. 병렬이라 벽시계는
+# 호출 수가 아니라 **파도 수**(청크수 ÷ 동시성)에 비례한다.
+#   27,031자 · 청크 3,500자 → 8청크 · 동시 8 → 한 파도 ≈ 5~6초
+DIGEST_CHUNK_CHARS = int(os.environ.get("DIGEST_CHUNK_CHARS", "3500"))
+DIGEST_CONCURRENCY = int(os.environ.get("DIGEST_CONCURRENCY", "8"))
+# 병리적인 경우를 막는 안전 상한. 여기 걸리면 못 덮은 조각은 추출식으로 가고,
+# 그 사실을 근거 블록에 적는다 — 조용히 빠지면 모델이 전부라고 믿는다.
+DIGEST_MAX_CALLS = int(os.environ.get("DIGEST_MAX_CALLS", "16"))
+
+# map 호출 하나에 걸 상한.
+DIGEST_CALL_CAP_S = float(os.environ.get("DIGEST_CALL_CAP_S", "12"))
+# 청크 하나당 뽑아낼 출력 토큰. 원문 3,500자에서 사실만 남기면 이 정도면 충분하다.
+DIGEST_OUT_TOKENS = int(os.environ.get("DIGEST_OUT_TOKENS", "500"))
 
 MAP_PROMPT = """Extract from the SOURCE only what could help answer the QUESTION.
 
@@ -146,6 +175,9 @@ def _should_run(raw_chars: int, extracted_chars: int, budget: int, deadline) -> 
         return "digest off"
     if raw_chars < DIGEST_MIN_CHARS:
         return f"원문이 작다 ({raw_chars}자 < {DIGEST_MIN_CHARS})"
+    if raw_chars < budget * DIGEST_TRIGGER_MULT:
+        # 예산으로 감당되는 크기다. 추출이 원문을 그대로 남기고 공짜다.
+        return f"예산으로 감당된다 (원문 {raw_chars}자 vs 예산 {budget}자)"
     if extracted_chars >= raw_chars:
         return "추출이 아무것도 버리지 않았다"
     if deadline is not None and deadline.remaining() < DIGEST_MIN_S:
@@ -161,10 +193,15 @@ async def digest(
     deadline=None,
     per_item_cap: int = 1400,
 ) -> tuple[list, int]:
-    """근거 항목들을 예산 안에 담는다. (담긴 (항목, 텍스트) 목록, 쓴 호출 수)
+    """가져온 원문 **전체**를 조각내어 요약하고, 그 요약으로 근거를 만든다.
 
-    먼저 추출로 줄여 보고, 그걸로 안 되는 크기일 때만 map 요약을 한 라운드 돌린다.
-    어떤 실패에서도 추출 결과로 물러난다 — 요약 때문에 근거가 사라지면 안 된다.
+    추출식 선택(compress.pack)은 예산 밖의 문단을 그냥 버린다. 실측에서 원문의
+    6~15% 만 남았고, 답을 결정하는 수치가 통째로 사라지는 것을 봤다.
+    요약은 버리지 않고 줄인다 — 그게 이 함수가 있는 이유다.
+
+    돌려주는 것: (담긴 (항목, 텍스트) 목록, 쓴 호출 수)
+    실패하거나 시간이 없으면 그 조각만 추출식으로 대신한다. 전부 실패하면
+    추출 결과를 그대로 돌려준다 — 요약 때문에 근거가 사라지는 일은 없다.
     """
     items = list(items)
     extracted = pack(items, query, budget=budget, per_item_cap=per_item_cap)
@@ -176,75 +213,97 @@ async def digest(
         log.debug("다이제스트 생략 — %s", skip)
         return extracted, 0
 
-    # 큰 항목부터 요약 대상으로 삼는다. 작은 것은 추출본이 이미 원문에 가깝다.
-    targets = sorted(items, key=lambda it: -len(getattr(it, "text", "") or ""))
+    # ── 모든 항목의 모든 조각을 일감으로 만든다 ──────────────
+    # 예전에는 큰 항목부터 상한까지만 담고 나머지를 버렸다. 그래서 문서의
+    # 80% 만 덮였고, 못 덮은 20% 는 추출식으로 떨어져 대부분 사라졌다.
     jobs: list[tuple[object, str]] = []
-    for it in targets:
+    for it in items:
         for ch in chunks(getattr(it, "text", "") or "", DIGEST_CHUNK_CHARS):
             jobs.append((it, ch))
-            if len(jobs) >= DIGEST_MAX_CALLS:
-                break
-        if len(jobs) >= DIGEST_MAX_CALLS:
-            break
     if not jobs:
         return extracted, 0
 
-    timeout = call_cap(deadline, DIGEST_CALL_CAP_S, reserve=0.0)
+    total_jobs = len(jobs)
+    uncovered = 0
+    if total_jobs > DIGEST_MAX_CALLS:
+        # 안전 상한. 못 덮은 조각은 버리지 않고 추출식으로 보낸다.
+        uncovered = total_jobs - DIGEST_MAX_CALLS
+        jobs = jobs[:DIGEST_MAX_CALLS]
+        log.info("다이제스트 상한 — %d조각 중 %d조각만 요약한다", total_jobs, len(jobs))
 
-    async def one(chunk: str) -> str:
-        data = await call_fm(
-            [{"role": "user", "content": MAP_PROMPT.format(query=query[:600], chunk=chunk)}],
-            DIGEST_OUT_TOKENS,
-            {"chat_template_kwargs": {"enable_thinking": False}},
-            timeout=timeout,
-        )
-        return (data["choices"][0]["message"].get("content") or "").strip()
+    timeout = call_cap(deadline, DIGEST_CALL_CAP_S, reserve=0.0)
 
     if DIGEST_STRATEGY == "refine":
         return await _refine(jobs, items, extracted, query, call_fm, deadline, timeout, budget)
 
-    log.info("다이제스트 map %d청크 병렬 요약 (원문 %d자, 추출 %d자)",
-             len(jobs), raw_chars, extracted_chars)
+    sem = asyncio.Semaphore(max(1, DIGEST_CONCURRENCY))
+
+    async def one(chunk: str) -> str:
+        async with sem:
+            if deadline is not None and deadline.expired(reserve=0.0):
+                raise TimeoutError("digest 시간 소진")
+            data = await call_fm(
+                [{"role": "user", "content": MAP_PROMPT.format(query=query[:600], chunk=chunk)}],
+                DIGEST_OUT_TOKENS,
+                {"chat_template_kwargs": {"enable_thinking": False}},
+                timeout=timeout,
+            )
+            return (data["choices"][0]["message"].get("content") or "").strip()
+
+    log.info(
+        "다이제스트 map — 원문 %d자 · %d조각 · 동시 %d (추출만 하면 %d자였다)",
+        raw_chars, len(jobs), DIGEST_CONCURRENCY, extracted_chars,
+    )
     results = await asyncio.gather(*(one(ch) for _, ch in jobs), return_exceptions=True)
 
-    # 항목별로 요약을 모은다. 실패한 청크는 그냥 빠진다.
+    # 항목별로 요약을 모은다. 실패한 조각은 그 항목의 추출본으로 메운다.
     by_item: dict[int, list[str]] = {}
     used_calls = 0
+    failed = 0
     for (it, _), r in zip(jobs, results):
         if isinstance(r, BaseException):
-            log.warning("청크 요약 실패: %s", type(r).__name__)
+            failed += 1
             continue
         used_calls += 1
         if not r or r.strip().upper() == "NONE":
             continue
         by_item.setdefault(id(it), []).append(r.strip())
 
+    if failed:
+        log.warning("조각 요약 %d/%d 실패 — 그만큼은 추출본으로 메운다", failed, len(jobs))
     if not by_item:
         log.info("다이제스트가 아무것도 못 건졌다 — 추출 결과를 쓴다")
         return extracted, used_calls
 
-    # 요약본으로 만든 대체 항목. 원본 메타데이터(title/url/cite_uid)는 그대로 쓴다.
     digested: list[tuple[object, str]] = []
     for it in items:
         summ = by_item.get(id(it))
+        fallback = next((t for o, t in extracted if o is it), "")
         if summ:
             text = "\n".join(summ)
+            if failed or uncovered:
+                # 못 덮은 부분이 있으면 추출본을 덧붙여 그 자리를 메운다.
+                if fallback and fallback not in text:
+                    text = text + "\n\n[from the un-condensed source]\n" + fallback
         else:
-            # 요약 대상이 아니었던 항목은 추출본을 쓴다.
-            text = next((t for o, t in extracted if o is it), "")
+            text = fallback
         if not text:
             continue
         digested.append((it, text))
 
-    # 요약본이 예산을 넘을 수도 있다. 마지막으로 한 번 더 조인다.
+    if uncovered:
+        log.info("요약하지 못한 %d조각은 추출본으로 대신했다", uncovered)
+
+    # 요약본도 예산을 지켜야 한다. 조각마다 500토큰씩 받으면 16조각이 2만 자를
+    # 넘길 수 있다 — 실측에서 58,862자 원문에 23,200자를 만들어 예산 12,000자를
+    # 넘겼다. 넘치면 요약본 자체를 다시 한 번 조인다.
     total = sum(len(t) for _, t in digested)
     if total > budget:
-        share = max(200, budget // max(1, len(digested)))
-        digested = [
-            (it, prune_text(t, query, share)[0]) for it, t in digested
-        ]
-    log.info("다이제스트 완료 — 호출 %d회 · %d자", used_calls,
-             sum(len(t) for _, t in digested))
+        share = max(300, budget // max(1, len(digested)))
+        digested = [(it, prune_text(t, query, share)[0]) for it, t in digested]
+        total = sum(len(t) for _, t in digested)
+    log.info("다이제스트 완료 — 호출 %d회 · %d자 (원문 %d자의 %.0f%%)",
+             used_calls, total, raw_chars, total / max(1, raw_chars) * 100)
     return digested, used_calls
 
 

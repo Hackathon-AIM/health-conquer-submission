@@ -100,6 +100,17 @@ def test_source_below_the_size_threshold_costs_zero_calls() -> None:
     assert calls == 0, f"불필요하게 {calls}회 불렀다"
 
 
+def test_source_within_budget_reach_costs_zero_calls() -> None:
+    """예산으로 감당되는 크기면 추출이 이긴다 — 원문 그대로이고 공짜다.
+
+    실측: 원문 27,031자에 예산 12,000자를 주면 추출만으로 PSA·Gleason·
+    10 ng/mL 이 전부 살아남는다. 같은 조건에서 요약은 호출 9회에 9.9초다.
+    """
+    fm = FakeFM()
+    packed, calls = run([Ev(text=BULK)], fm, budget=len(BULK), deadline=Deadline.start(120.0))
+    assert calls == 0, f"예산으로 감당되는데 {calls}회 불렀다"
+
+
 def test_skips_when_out_of_time() -> None:
     fm = FakeFM()
     spent = Deadline(total=40.0, started=time.monotonic() - 35.0)  # 남은 5초
@@ -110,11 +121,38 @@ def test_skips_when_out_of_time() -> None:
 
 # ── 돌 때: 병렬 한 라운드 ─────────────────────────────────────
 def test_runs_in_parallel_not_sequentially() -> None:
-    """순차 refine 이면 청크 수만큼 지연이 쌓인다. 그건 예산을 넘긴다."""
-    fm = FakeFM(delay=0.1)
-    packed, calls = run([Ev(text=BULK)], fm, deadline=Deadline.start(40.0))
+    """순차면 청크 수만큼 지연이 쌓인다. 다만 무제한 병렬도 안 된다 —
+
+    동시성에 상한이 없으면 우리 요청 하나가 상류를 밀어낸다. 그래서 파도로 돈다:
+    벽시계 ≈ (청크수 ÷ 동시성) × 호출 1회.
+    """
+    fm = FakeFM(delay=0.05)
+    packed, calls = run([Ev(text=BULK)], fm, deadline=Deadline.start(60.0))
     assert calls >= 2, f"요약이 안 돌았다 (calls={calls})"
-    assert fm.max_concurrent == calls, f"동시 {fm.max_concurrent} / 전체 {calls} — 직렬로 돌았다"
+    assert fm.max_concurrent > 1, "직렬로 돌았다"
+    assert fm.max_concurrent <= D.DIGEST_CONCURRENCY, (
+        f"동시 {fm.max_concurrent} > 상한 {D.DIGEST_CONCURRENCY}"
+    )
+
+
+def test_covers_every_chunk_not_just_the_first_few() -> None:
+    """예전 상한 4청크는 27,031자 문서의 80% 만 덮었다.
+
+    못 덮은 조각은 추출식으로 떨어져 대부분 버려졌다 — 그게 이 파일의 요지다.
+    """
+    n_chunks = len(D.chunks(BULK, D.DIGEST_CHUNK_CHARS))
+    fm = FakeFM()
+    packed, calls = run([Ev(text=BULK)], fm, budget=12000, deadline=Deadline.start(120.0))
+    assert calls == min(n_chunks, D.DIGEST_MAX_CALLS), (
+        f"{n_chunks}조각 중 {calls}개만 요약했다"
+    )
+
+
+def test_summary_stays_within_budget() -> None:
+    """조각마다 요약을 받으면 합계가 예산을 넘을 수 있다 — 실측에서 23,200자가 나왔다."""
+    fm = FakeFM(reply="사실 한 줄. " * 120)
+    packed, calls = run([Ev(text=BULK)], fm, budget=3000, deadline=Deadline.start(120.0))
+    assert sum(len(t) for _, t in packed) <= 3300, sum(len(t) for _, t in packed)
 
 
 def test_call_count_is_capped() -> None:
