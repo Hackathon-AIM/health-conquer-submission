@@ -24,9 +24,13 @@ data/build_dicts.py
 
 # ── 이번 제출 진입점은 app.py(FastAPI) 다. 아래는 팀의 다른 파이프라인 자산이라
 #    이미지에 넣지 않는다. 저장소에는 그대로 남는다. 빌드 5분 제한 때문이다.
+#
+#    ⚠️ submission/ 은 여기서 뺐다. app.py 가 키 해석(resolve_api_key)과 컨텍스트
+#       예산을 그 패키지에서 가져오기 때문이다. 여기 넣어 두면 이미지에 안 들어가고
+#       컨테이너가 ModuleNotFoundError 로 즉사한다 — preflight 2단계에서 실제로 봤다.
+#       순수 stdlib 라 빌드 시간에는 영향이 없다 (실측 2초).
 serve.py
 src
-submission
 configs
 static
 evals
