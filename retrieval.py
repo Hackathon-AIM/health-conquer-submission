@@ -288,20 +288,14 @@ async def run_retrieval(
                 break
 
             res.tool_calls_used += 1
-            step = f"{fn}({json.dumps(args, ensure_ascii=False)[:120]})"
+            res.trace.append(f"{fn}({json.dumps(args, ensure_ascii=False)[:120]})")
             try:
                 payload = await mcp.call_tool(fn, args)
-                before = len(harvested)
                 _harvest(payload, harvested)
                 content = json.dumps(payload, ensure_ascii=False)
-                # 호출만 찍으면 "빈손으로 돌아온 것"과 "받고도 안 연 것"이 구분되지 않는다.
-                # 응답 크기와 새로 얻은 cite_uid 수를 같이 남긴다.
-                step += f" → {len(content):,}자 · cite_uid +{len(harvested) - before}"
             except Exception as e:  # noqa: BLE001 — 한 도구가 죽어도 계속 간다
                 log.warning("도구 %s 실패: %s", fn, str(e)[:200])
                 content = json.dumps({"error": str(e)[:300]}, ensure_ascii=False)
-                step += f" → 실패: {str(e)[:80]}"
-            res.trace.append(step)
 
             messages.append(
                 {"role": "tool", "tool_call_id": tc.get("id") or "", "content": content[:12000]}

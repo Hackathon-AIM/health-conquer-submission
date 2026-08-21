@@ -128,14 +128,13 @@ ROUTE_SCHEMA: dict[str, Any] = {
         "urgency": {"type": "string", "enum": ["emergency", "conditional", "routine"]},
         "context": {"type": "string", "enum": ["sufficient", "missing_critical"]},
         "ask_back": {"type": "string"},
-        "provisional": {"type": "string"},
         "persona": {"type": "string", "enum": ["layperson", "practitioner", "clinician"]},
         "lang": {"type": "string", "enum": ["ko", "en"]},
         "date_sensitive": {"type": "boolean"},
         "search_query": {"type": "string"},
     },
     "required": [
-        "domain", "urgency", "context", "ask_back", "provisional",
+        "domain", "urgency", "context", "ask_back",
         "persona", "lang", "date_sensitive", "search_query",
     ],
     "additionalProperties": False,
@@ -154,11 +153,7 @@ class Route:
     context: str = "sufficient"  # sufficient | missing_critical
     persona: str = "layperson"  # layperson | practitioner | clinician
     lang: str = "ko"
-    ask_back: str = ""  # context=missing_critical 일 때 되물을 질문 하나
-    # 되묻기 전에 먼저 주는 조건부 안내. 되묻는 턴이 빈 턴이 되지 않게 한다.
-    # 실측: 되묻기 경로에서 76자짜리 "상황에 따라 다릅니다"만 나간 턴이 있었다.
-    # 프론티어 모델과 블라인드로 비교당하는 자리에서 이런 턴은 그대로 진다.
-    provisional: str = ""
+    ask_back: str = ""  # context=missing_critical 일 때 되물을 문장 하나
     date_sensitive: bool = False  # 날짜가 박힌 질문이면 effective_date 대조가 필요하다
     # 멀티턴 지시대명사를 푼 self-contained 검색 질의. 라우터가 여기서 만들어 두면
     # generation 단계에서 "모델에게 도구를 줘서 질의를 받아오는" 왕복 한 번이 통째로 없어진다.
@@ -210,15 +205,8 @@ Return ONLY a JSON object, no prose, with these keys:
   other medications, or why they want it. Use "sufficient" when a conditional answer covering the
   main branches is genuinely just as good, and always when it is an emergency.
 
-"ask_back": if context is "missing_critical", the single highest-value question to ask, in
-  Korean, one sentence. It MUST be an actual question ending in "?" — not a statement about what
-  depends on what, and not a list of things to check. Otherwise "".
-
-"provisional": if context is "missing_critical", a short conditional answer to give BEFORE asking,
-  in Korean, 2-4 sentences. Cover the main branches ("A라면 …, B라면 …") and name the safest
-  default with concrete specifics (drug/dose/step) where it is safe to do so. Never leave the
-  person with nothing — a turn that only asks a question and gives no usable guidance is a failed
-  turn. Otherwise "".
+"ask_back": if context is "missing_critical", the single highest-value question to ask, in Korean,
+  one sentence. Otherwise "".
 
 "persona": "layperson" (casual speech, slang, typos, personal worry), "practitioner" (billing,
   claims, pharmacy or administrative work), or "clinician" (uses clinical terminology, asks about
@@ -286,7 +274,6 @@ def build_route(raw: dict[str, Any] | None, question: str, source: str) -> Route
 
     r.lang = "en" if str(raw.get("lang") or "").strip() == "en" else "ko"
     r.ask_back = str(raw.get("ask_back") or "").strip()
-    r.provisional = str(raw.get("provisional") or "").strip()
     # 라우터가 질의를 못 만들었으면 마지막 사용자 발화를 그대로 쓴다. 지시대명사가
     # 남아 있을 수 있지만, 검색을 통째로 건너뛰는 것보다는 낫다.
     r.search_query = str(raw.get("search_query") or "").strip() or question
@@ -301,7 +288,6 @@ def build_route(raw: dict[str, Any] | None, question: str, source: str) -> Route
     if r.urgency == "emergency":
         r.context = "sufficient"
         r.ask_back = ""
-        r.provisional = ""
 
     r.tools = list(DOMAIN_TOOLS[r.domain])
 
@@ -329,7 +315,7 @@ async def classify(messages: list[dict], call_fm) -> Route:
     try:
         data = await call_fm(
             [{"role": "user", "content": CLASSIFY_PROMPT.format(question=transcript(messages))}],
-            800,
+            512,
             {"response_format": ROUTE_RESPONSE_FORMAT},
         )
         content = data["choices"][0]["message"].get("content") or ""

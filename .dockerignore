@@ -21,6 +21,19 @@ data/probe
 # 제출 이미지에도 넣지 않는다 (make 타깃도 실행 차단 상태).
 data/extract_redflags.py
 data/build_dicts.py
-# 서빙에 쓰이지 않는다
+
+# ── 이번 제출 진입점은 app.py(FastAPI) 다. 아래는 팀의 다른 파이프라인 자산이라
+#    이미지에 넣지 않는다. 저장소에는 그대로 남는다. 빌드 5분 제한 때문이다.
+serve.py
+src
+submission
+configs
 static
 evals
+eval
+data
+docs
+Makefile
+go.sh
+AGENTS.md
+requirements-serve.txt

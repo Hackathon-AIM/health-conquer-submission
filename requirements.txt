@@ -1,7 +1,3 @@
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 httpx==0.28.1
-
-# 약물 안전 게이트(submission/drug_safety.py)가 data/risk_rules.yaml 을 읽는다.
-# pydantic 은 fastapi 가 이미 끌고 온다.
-pyyaml==6.0.2

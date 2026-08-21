@@ -23,116 +23,45 @@ from generation import generate
 from mcp_client import MCPClient
 from router import classify
 
-# ── 우리 층: 약물 안전 게이트 ───────────────────────────────────
-# safety 는 응급(119)만 본다. "와파린+아스피린", "음주 후 진통제" 같은
-# 약물 상호작용은 아무도 안 본다. 그리고 실제 질문은 "이거 먹어도 되나요"보다
-# "뭘 먹으면 되나요"가 많아서, 검사해야 할 대상은 입력이 아니라 **모델의 답변**이다.
-# 결정론·동기·무통신이라 지연이 사실상 0이고, 실패해도 원문을 그대로 돌려준다.
+# ── 우리 층 ─────────────────────────────────────────────────
+# drug_safety 는 stdlib 만 쓴다. 그래도 import 를 감싸는 이유: 이 파일이 어떤 이유로든
+# 못 읽히면 서버가 통째로 못 뜨고, 그건 전 문항 0점이다. 실제로 그렇게 네 번 죽었다.
 try:
     from drug_safety import guard as _drug_guard
-except Exception as _e:                                    # 사전이 없어도 서버는 뜬다
+except Exception as _e:                                 # pragma: no cover
     logging.getLogger("driver").error("약물 안전 게이트 비활성: %r", _e)
-    def _drug_guard(_convo: str, answer: str) -> str:      # type: ignore[misc]
+
+    def _drug_guard(_convo, answer):
         return answer
 
-# 응급 안내가 이미 첫머리에 있으면 경고를 덧대지 않는다 (중복 = 감점).
+# 응급 안내가 이미 첫머리에 있으면 덧대지 않는다 (중복 = 감점).
 _EMERGENCY_LEAD = re.compile(r"119|응급실|즉시 (?:병원|진료|의료)")
-
-# ── 대화 이력 상한 ────────────────────────────────────────────
-# generation 은 이력을 그대로 넘긴다(convo.extend(messages)). 거기에 검색 근거까지
-# 얹히므로 긴 멀티턴에서 input_limit_exceeded 가 날 수 있고, 그러면 그 턴은 통째로
-# 0점이다. 이전 하네스에서 실제로 겪었다(tool_result 12,000자 × 8건 = 96,000자).
-# 개선이 아니라 보험이다. 그래서 상한은 넉넉하게 잡는다.
-HISTORY_MAX_CHARS = int(os.environ.get("HISTORY_MAX_CHARS", "24000"))
-HISTORY_MAX_TURNS = int(os.environ.get("HISTORY_MAX_TURNS", "16"))
-
-
-def trim_history(messages: list[dict]) -> list[dict]:
-    """뒤에서부터 예산 안에 들어오는 만큼만 남긴다. 최근 턴이 가장 중요하다."""
-    if len(messages) <= 2:
-        return messages
-    kept: list[dict] = []
-    total = 0
-    for m in reversed(messages[-HISTORY_MAX_TURNS:]):
-        n = len(str(m.get("content") or ""))
-        # 마지막 두 개(직전 답변 + 지금 질문)는 예산과 무관하게 지킨다.
-        if kept and total + n > HISTORY_MAX_CHARS and len(kept) >= 2:
-            break
-        kept.append(m)
-        total += n
-    kept.reverse()
-    if len(kept) < len(messages):
-        log.info("이력 축소: %d턴 → %d턴 (%d자)", len(messages), len(kept), total)
-    return kept
-
-
-# ── 응급 안전망 ───────────────────────────────────────────────
-# 응급 판정인데 답변이 응급 안내로 시작하지 않으면, 그때만 앞에 붙인다.
-# 평소엔 모델이 알아서 넣는다(실측). 그래서 "항상"이 아니라 "놓쳤을 때만"이다.
-# 항상 붙이면 중복이 되고 중복은 의사소통 감점이다.
-_EMERGENCY_LEAD_IN = (
-    "**지금 119에 연락하거나 가까운 응급실로 가세요.** "
-    "말씀하신 증상은 즉시 진료가 필요할 수 있습니다. "
-    "혼자 운전하지 마시고 주변 사람에게 도움을 요청하세요."
-)
-# 근거 0건인데 붙은 인용번호는 환각이다. 프롬프트로만 막던 것을 코드로 막는다.
-# [1] 뿐 아니라 [1,2] · [1, 2] 형태도 잡는다 — 실측에서 이 형태가 나왔다.
+# [1] · [1,2] · [1, 2] 를 모두 잡는다 — 실측에서 다 나왔다.
 _CITE_MARK = re.compile(r"\s*\[\s*\d+(?:\s*[,·]\s*\d+)*\s*\]")
 
+# ── 근거가 필요한 질문만 MCP 를 태운다 ─────────────────────────
+# 기준선(하네스 없이 L2 그대로)이 38.34 를 받았고, 하네스를 항상 태운 판은 29.13 이었다.
+# 그러니 하네스를 전면 복원하는 건 도박이다. 대신 **L2 가 알 수 없는 것**에만 태운다:
+# 한국 법령 조문·급여기준·고시·약가·질병코드·진료지침. 이건 모델 안에 없고 문서에만 있다.
+# 나머지 질문은 38.34 와 완전히 같은 경로로 간다.
+_NEEDS_DOCS = re.compile(
+    r"제\s*\d+\s*조|시행령|시행규칙|법령|법\s*상|고시|급여|비급여|본인부담|상한제|"
+    r"수가|청구|산정|약가|약값|상한금액|KCD|상병\s*코드|질병\s*코드|허가사항|"
+    r"효능효과|용법|가이드라인|진료지침|권고\s*(기준|사항|등급)|근거\s*수준"
+)
+# 인덱스 코퍼스는 둘뿐이고 어느 쪽인지는 도메인이 이미 안다.
+# 실측: "가이드라인상 혈압 목표" 질문에서 모델이 corpus_tag="hira"(급여기준)를 골라
+# 5회를 다 쓰고 관련 없는 페이지 하나만 열었다. 모델 재량에 맡길 이유가 없다.
+_CORPUS_HINT = {"guideline_index": "guideline", "hira_updates": "hira"}
+_DOC_DOMAINS = {"guideline_index", "korean_law", "hira_updates", "kcd",
+                "hira_drug_price", "mfds"}
 
-# 실측: 답변이 "Assistant" 한 줄로 시작해서 나왔다. 채팅 템플릿 누수다.
-# 사람이 읽으면 바로 눈에 띄고 의사소통(21.2%)에서 값을 잃는다.
-_ROLE_LEAK = re.compile(r"^\s*(?:Assistant|assistant|어시스턴트)\s*[:：]?\s*\n+")
-
-
-def strip_role_leak(content: str) -> str:
-    return _ROLE_LEAK.sub("", content, count=1)
-
-
-# ── 출처 표기 ────────────────────────────────────────────────
-# 프론티어 상은 임상의가 우리 답과 프론티어 모델 답을 **나란히 놓고 블라인드로** 읽는다.
-# 5B 모델이 문장력·지식 폭으로 프론티어를 이길 수는 없다. 이길 수 있는 자리는 하나뿐이다 —
-# **한국 문서에 실제로 근거한 답**(급여기준·고시·법령 조문·허가사항). 프론티어는 그걸 못 본다.
-#
-# 그런데 지금은 본문에 [1] 만 떠 있고 그게 무엇인지 화면에 없다. 읽는 사람 입장에서
-# 출처 없는 [1] 은 근거가 아니라 오히려 지어낸 것처럼 보인다. 우위를 만들어 놓고 안 보여주는 셈.
-# 실제로 인용된 번호만, 제목/URL 이 있는 것만 짧게 붙인다 (완전성은 채점 4%뿐이다).
-def render_sources(content: str, items: list) -> str:
-    if not content or not items:
-        return content
-    used = sorted({n for m in _CITE_MARK.finditer(content)
-                   for n in (int(x) for x in re.findall(r"\d+", m.group(0)))
-                   if 1 <= n <= len(items)})
-    lines = []
-    for n in used:
-        ev = items[n - 1]
-        label = (getattr(ev, "title", "") or "").strip()
-        url = (getattr(ev, "url", "") or "").strip()
-        if not label and not url:
-            continue
-        lines.append(f"[{n}] {label or url}" + (f" — {url}" if label and url else ""))
-    if not lines:
-        return content
-    return content.rstrip() + "\n\n---\n**참고한 자료**\n" + "\n".join(lines)
-
-
-def strip_bad_citations(content: str, n_items: int) -> str:
-    """근거 개수를 넘는 인용번호를 지운다.
-
-    없는 근거를 가리키는 인용은 인용이 없는 것보다 나쁘다 — 읽는 사람이
-    "확인된 사실"로 받아들이기 때문이다. 정확성이 채점 43%다.
-    번호가 전부 유효하면 그대로 둔다(진짜 인용까지 지우면 손해).
-    """
-    def fix(m: re.Match) -> str:
-        nums = [int(x) for x in re.findall(r"\d+", m.group(0))]
-        good = [x for x in nums if 1 <= x <= n_items]
-        if len(good) == len(nums):
-            return m.group(0)
-        if not good:
-            return ""
-        lead = m.group(0)[:len(m.group(0)) - len(m.group(0).lstrip())]
-        return f"{lead}[{','.join(map(str, good))}]"
-    return _CITE_MARK.sub(fix, content)
+# 인덱스 코퍼스는 "찾기 → 열기"가 최소 2단계다. cite_uid 는 본문을 열어야만 나오므로
+# 3회로는 못 연다(실측: calls=3 items=0). 시간은 run_retrieval 이 매 스텝 deadline 을
+# 보고 스스로 끊으므로 예산을 늘려도 REQUEST_BUDGET_S 를 넘지 않는다.
+# ⚠️ 상수로 둔다 — os.environ.get(x, "5") 는 x 가 빈 문자열이면 int("") 로 터지고,
+#    그건 모듈 import 실패이자 컨테이너 기동 실패다.
+DOC_RETRIEVAL_BUDGET = 5
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("driver")
@@ -160,17 +89,6 @@ FM_BACKOFF = float(os.environ.get("FM_BACKOFF", "1.5"))
 RETRIEVAL_BUDGET = int(os.environ.get("RETRIEVAL_BUDGET", "3"))
 EMERGENCY_BUDGET = int(os.environ.get("EMERGENCY_BUDGET", "2"))
 
-# 인덱스 코퍼스(가이드라인·고시·법령)는 **찾기 → 열기**가 최소 2단계라
-# 3회로는 본문을 못 연다. 열지 못한 것은 cite_uid 가 없어 인용 자체가 불가능하다.
-#   실측: guideline_index / korean_law 질문이 calls=3 을 다 쓰고 items=0 으로 끝났다.
-#         반면 단발 조회(mfds)는 calls=1 로 sufficient 를 받았다.
-# 시간은 run_retrieval 이 매 스텝 deadline 을 보고 스스로 끊으므로, 예산을 늘려도
-# REQUEST_BUDGET_S 를 넘기지 않는다. 늘려서 잃는 건 없고 못 열면 통째로 잃는다.
-DEEP_DOMAINS = {"guideline_index", "korean_law", "hira_updates", "kcd"}
-# 인덱스 코퍼스는 두 개다(임상 가이드라인 / 심평원 고시). 도메인이 곧 코퍼스다.
-CORPUS_HINT = {"guideline_index": "guideline", "hira_updates": "hira"}
-DEEP_BUDGET = int(os.environ.get("DEEP_RETRIEVAL_BUDGET", "5"))
-
 # 요청 하나에 쓸 수 있는 총 시간. RESERVE 는 최종 답변 생성 몫으로 떼어 둔다.
 #
 # 처음엔 75초로 뒀는데, 그 값으로 돌린 trial 이 0.00 을 받았다. 같은 회차에서
@@ -183,13 +101,6 @@ ANSWER_RESERVE_S = float(os.environ.get("ANSWER_RESERVE_S", "18"))
 # MCP 를 6회까지 부르기 때문에 동시 요청이 몰리면 상류가 먼저 무너진다.
 FM_CONCURRENCY = int(os.environ.get("FM_CONCURRENCY", "24"))
 MCP_CONCURRENCY = int(os.environ.get("MCP_CONCURRENCY", "12"))
-
-# temperature 를 안 보내면 서버 기본값이 붙는다. 실측: 같은 질문("타이레놀 1회 최대 용량")에
-# 세 번 물어 650~1,000mg / 500mg / 1,000mg 로 세 번 다 다르게 답했다. 허가사항은 하나인데
-# 매번 다른 수치를 말하는 건 정확성(채점 43%)에서 그대로 깎이는 자리다.
-# 0 이 아니라 0.3 인 이유: 완전 결정론은 표현이 뻣뻣해져 의사소통(21.2%)에서 손해를 볼 수 있고,
-# 팀이 같은 값으로 트라이얼을 돌리고 있어 결과를 비교할 수 있다.
-FM_TEMPERATURE = float(os.environ.get("FM_TEMPERATURE", "0.3"))
 
 # L2 는 사고과정을 별도 `reasoning` 필드로 뱉는데, 그게 2048 예산을 통째로 먹는다.
 # 실측(같은 질문):
@@ -219,10 +130,8 @@ async def lifespan(_: FastAPI):
     if not FM_KEY:
         log.error("LUNIT_FM_API_KEY 가 비어 있다. 모든 생성 요청이 실패한다.")
     log.info(
-        "driver up — model=%s max_tokens=%d temp=%.2f thinking=%s budget=%.0fs "
-        "fm_conc=%d mcp_conc=%d",
-        FM_MODEL, MAX_TOKENS, FM_TEMPERATURE, ENABLE_THINKING, REQUEST_BUDGET_S,
-        FM_CONCURRENCY, MCP_CONCURRENCY,
+        "driver up — model=%s max_tokens=%d thinking=%s budget=%.0fs fm_conc=%d mcp_conc=%d",
+        FM_MODEL, MAX_TOKENS, ENABLE_THINKING, REQUEST_BUDGET_S, FM_CONCURRENCY, MCP_CONCURRENCY,
     )
     try:
         yield
@@ -260,7 +169,7 @@ async def call_fm(
         "model": FM_MODEL,
         "messages": messages,
         "max_tokens": min(max_tokens, SERVER_MAX_TOKENS),
-        "temperature": FM_TEMPERATURE,
+        "temperature": 0.3,
         "chat_template_kwargs": {"enable_thinking": ENABLE_THINKING},
         **(extra or {}),
     }
@@ -294,102 +203,117 @@ async def call_fm(
     raise last
 
 
-async def generate_reply(messages: list[dict], dl: Deadline) -> str:
+def _last_user(messages: list[dict]) -> str:
+    for m in reversed(messages):
+        if isinstance(m, dict) and m.get("role") == "user":
+            return str(m.get("content") or "")
+    return ""
+
+
+def _strip_bad_citations(content: str, n_items: int) -> str:
+    """근거 개수를 넘는 인용번호를 지운다.
+
+    없는 근거를 가리키는 인용은 인용이 없는 것보다 나쁘다 — 읽는 사람이
+    "확인된 사실"로 받아들이기 때문이다. 번호가 전부 유효하면 손대지 않는다.
+    실측: 근거 1건인데 [1,2] 를 달았고, 그 1건은 답변 내용과 무관한 문서였다.
+    """
+    def fix(m):
+        nums = [int(x) for x in re.findall(r"\d+", m.group(0))]
+        good = [x for x in nums if 1 <= x <= n_items]
+        if len(good) == len(nums):
+            return m.group(0)
+        if not good:
+            return ""
+        lead = m.group(0)[:len(m.group(0)) - len(m.group(0).lstrip())]
+        return lead + "[" + ",".join(str(x) for x in good) + "]"
+    return _CITE_MARK.sub(fix, content)
+
+
+def _render_sources(content: str, items: list) -> str:
+    """살아남은 인용번호에만 출처를 붙인다.
+
+    프론티어 모델과 블라인드로 비교당하는 자리에서 우리가 이길 수 있는 건
+    **한국 문서에 실제로 근거한 답**뿐이다. 그런데 본문에 [1] 만 있고 그게
+    무엇인지 화면에 없으면, 읽는 사람에겐 근거가 아니라 지어낸 것처럼 보인다.
+    """
+    if not content or not items:
+        return content
+    used = sorted({n for m in _CITE_MARK.finditer(content)
+                   for n in (int(x) for x in re.findall(r"\d+", m.group(0)))
+                   if 1 <= n <= len(items)})
+    lines = []
+    for n in used:
+        ev = items[n - 1]
+        label = (getattr(ev, "title", "") or "").strip()
+        url = (getattr(ev, "url", "") or "").strip()
+        if not label and not url:
+            continue
+        lines.append("[%d] %s%s" % (n, label or url, (" — " + url) if label and url else ""))
+    if not lines:
+        return content
+    return content.rstrip() + "\n\n---\n**참고한 자료**\n" + "\n".join(lines)
+
+
+async def _grounded_reply(messages: list[dict], dl: Deadline) -> str:
+    """MCP 로 한국 문서를 열어 근거를 붙여 답한다.
+
+    이 경로에서 무엇이 실패하든 예외를 올린다 — 호출부가 기준선으로 되돌린다.
+    """
     route = await classify(messages, call_fm)
-    log.info(
-        "route: domain=%s urgency=%s context=%s persona=%s date=%s src=%s tools=%d",
-        route.domain, route.urgency, route.context, route.persona,
-        route.date_sensitive, route.source, len(route.tools),
-    )
+    log.info("route: domain=%s urgency=%s persona=%s tools=%d",
+             route.domain, route.urgency, route.persona, len(route.tools))
 
-    # 결정적 맥락이 빠졌고 응급도 아니면, 답을 지어내지 말고 하나만 되묻는다.
-    # 09 문서 §4 — 맥락인지는 Consensus 두 번째로 큰 축(24.7%)이고 프론티어가 무너지는 곳이다.
-    #
-    # 다만 **묻기만 하고 끝내지는 않는다.** 실측: 이 경로에서 76자짜리
-    # "어떤 두통약을 고를지는 상황에 따라 완전히 달라집니다."만 나간 턴이 있었다.
-    # 답도 아니고 질문도 아닌 턴이고, 프론티어 모델과 블라인드로 붙는 자리에서 그대로 진다.
-    # 라우터가 같은 호출에서 조건부 안내(provisional)를 같이 만들어 두므로 FM 호출은 늘지 않는다.
-    if route.context == "missing_critical" and route.ask_back:
-        if route.provisional:
-            return f"{route.provisional}\n\n{route.ask_back}"
-        return route.ask_back
+    # 문서 도메인이 아니면 굳이 검색하지 않는다. 기준선이 더 낫다.
+    if route.domain not in _DOC_DOMAINS or not route.tools:
+        raise RuntimeError("문서 도메인이 아니다: %s" % route.domain)
 
-    # 응급이면 검색을 짧게 끊는다. 실측에서 예산 6회를 다 쓰고 31초가 걸렸는데,
-    # 정작 근거는 "약물 부작용 자료에서 확인되지 않음"이라 답에 보탬이 없었다.
-    # 응급에서 값을 내는 건 근거 인용이 아니라 즉시 의뢰다.
-    # 실측: "가이드라인상 혈압 목표" 질문에서 모델이 corpus_tag="hira"(급여기준)를
-    # 골라 5회를 다 쓰고 관련 없는 페이지 하나만 열었다. 어느 코퍼스인지는 도메인이
-    # 이미 알고 있으므로 모델 재량에 맡길 이유가 없다.
-    hint = CORPUS_HINT.get(route.domain)
+    hint = _CORPUS_HINT.get(route.domain)
     if hint and route.search_query:
         route.search_query = (
-            f'{route.search_query}\n(Use corpus_tag="{hint}" for index tools '
-            f'— this question belongs to the {hint} corpus.)'
+            route.search_query
+            + '\n(Use corpus_tag="%s" for index tools — this question belongs to '
+              'the %s corpus.)' % (hint, hint)
         )
 
-    if route.urgency == "emergency":
-        budget = EMERGENCY_BUDGET
-    elif route.domain in DEEP_DOMAINS:
-        budget = DEEP_BUDGET
-    else:
-        budget = RETRIEVAL_BUDGET
-
-    # 라우터에서 이미 시간을 많이 썼으면 검색을 통째로 건너뛴다. 근거 있는 답보다
-    # 답이 있는 것이 먼저다 — 빈 응답은 채점에서 0점이고, 실측으로 그걸 봤다.
     if dl.expired(reserve=ANSWER_RESERVE_S):
-        log.warning("시간이 모자라 검색을 건너뛴다 (남은 %.0fs)", dl.remaining())
-        route.tools = []
+        raise RuntimeError("검색할 시간이 없다")
 
     content, result = await generate(
-        messages, route, call_fm, MCP, MAX_TOKENS, budget, dl, ANSWER_RESERVE_S
+        messages, route, call_fm, MCP, MAX_TOKENS,
+        DOC_RETRIEVAL_BUDGET, dl, ANSWER_RESERVE_S,
     )
-
-    # 검색이 왜 빈손인지는 호출 이력을 봐야 안다. status/items 만으로는
-    # "못 찾은 것"과 "찾았는데 본문을 안 연 것"이 구분되지 않는다.
     for step in (getattr(result, "trace", None) or []):
         log.info("  retrieval· %s", step)
-
-    # content 가 비는 건 대개 reasoning 이 예산을 다 먹고 잘린 경우다.
-    # max_tokens 를 더 올릴 수는 없으므로(2048 이 상한), 도구 없이 한 번 더 시도한다.
     if not content:
-        log.warning("빈 content — 도구 없이 재시도 (elapsed %.0fs)", dl.elapsed)
-        data = await call_fm(messages, MAX_TOKENS)
-        content = (data["choices"][0]["message"].get("content") or "").strip()
+        raise RuntimeError("근거 경로가 빈 답을 냈다")
 
+    items = list(getattr(result, "items", None) or [])
+    fixed = _strip_bad_citations(content, len(items))
+    if fixed != content:
+        log.info("근거 %d건을 넘는 인용번호를 제거했다", len(items))
+        content = fixed
+    return _render_sources(content, items)
+
+
+async def generate_reply(messages: list[dict], dl: Deadline) -> str:
+    """기본은 기준선(L2 그대로). 문서가 있어야 답할 수 있는 질문만 MCP 를 태운다."""
+    text = _last_user(messages)
+    if text and _NEEDS_DOCS.search(text):
+        try:
+            return await _grounded_reply(messages, dl)
+        except Exception as e:      # noqa: BLE001 — 근거 경로는 부가 기능이다
+            log.warning("근거 경로 미사용/실패 → 기준선으로 (%s)", str(e)[:120])
+
+    data = await call_fm(messages, MAX_TOKENS)
+    content = (data["choices"][0]["message"].get("content") or "").strip()
     if not content:
-        log.error("빈 content 로 응답한다 — elapsed=%.1fs", dl.elapsed)
-
-    # 응급인데 응급 안내로 시작하지 않으면 그때만 앞에 붙인다.
-    if content and route.urgency == "emergency" and not _EMERGENCY_LEAD.search(content[:200]):
-        log.info("응급 판정인데 답변 앞에 안내가 없다 — 안전망 문구 삽입")
-        content = _EMERGENCY_LEAD_IN + "\n\n" + content
-
-    if content:
-        cleaned = strip_role_leak(content)
-        if cleaned != content:
-            log.info("역할 라벨 누수 제거")
-            content = cleaned
-
-    # 근거 개수를 넘는 인용번호는 지어낸 것이다.
-    if content and _CITE_MARK.search(content):
-        n_items = len(result.items) if result else 0
-        fixed = strip_bad_citations(content, n_items)
-        if fixed != content:
-            log.info("근거 %d건을 넘는 인용번호를 제거했다", n_items)
-            content = fixed
-
-    # 살아남은 인용번호에 대해서만 출처를 붙인다.
-    if content and result and result.items:
-        with_src = render_sources(content, result.items)
-        if with_src != content:
-            log.info("출처 표기 삽입")
-            content = with_src
+        log.error("L2 raw 응답의 content가 비었다 — elapsed=%.1fs", dl.elapsed)
     return content
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(body: dict) -> dict[str, Any]:
-    messages = trim_history(body.get("messages") or [])
+    messages = body.get("messages") or []
     dl = Deadline.start(REQUEST_BUDGET_S)
     try:
         # 단계마다 남은 시간을 보며 스스로 줄이지만, 그래도 넘기면 여기서 끊는다.
@@ -417,11 +341,11 @@ async def chat_completions(body: dict) -> dict[str, Any]:
     try:
         if content and not _EMERGENCY_LEAD.search(content[:200]):
             convo = "\n".join(
-                f"{m.get('role', '')}: {m.get('content', '')}"
+                "%s: %s" % (m.get("role", ""), m.get("content", ""))
                 for m in messages if isinstance(m, dict)
             )
             content = _drug_guard(convo, content)
-    except Exception:
+    except Exception:                       # noqa: BLE001 — 답변을 잃는 것이 최악이다
         log.exception("약물 안전 게이트 실패 — 원문 유지")
 
     log.info("응답 %d자 / %.1fs", len(content), dl.elapsed)

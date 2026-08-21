@@ -19,6 +19,10 @@ set -uo pipefail
 
 IMG=medai-preflight
 CNT=medai-preflight-run
+# 호스트 포트는 8000 을 피한다 — 개발용 `docker run -p 8000:8000` 이 떠 있으면
+# 바인드가 충돌해 컨테이너가 exit 128 로 죽고, 우리 앱 문제로 오인하게 된다.
+# 컨테이너 안쪽은 규정대로 8000 그대로다.
+HOST_PORT=${PREFLIGHT_PORT:-18000}
 WORK=$(mktemp -d)
 LOGF="$WORK/container.log"
 FAIL=0
@@ -36,6 +40,8 @@ trap cleanup EXIT
 
 # ── 0. 커밋 상태 ──────────────────────────────────────────────
 say "0. 커밋 상태 — 평가자는 커밋된 것만 본다"
+RUNNING_N=$(docker ps -q | wc -l | tr -d ' ')
+[ "$RUNNING_N" != "0" ] && warn "다른 컨테이너 ${RUNNING_N}개가 떠 있다 (호스트 포트 $HOST_PORT 로 피해서 띄운다)"
 if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
   bad "커밋 안 된 수정이 있다. 커밋하고 다시 실행하라:"
   git status --short --untracked-files=no | sed 's/^/     /'
@@ -69,7 +75,11 @@ fi
 # ── 2. create → start --attach 로 기동 ────────────────────────
 say "2. 기동 — docker create → start --attach (평가자와 동일)"
 docker rm -f "$CNT" >/dev/null 2>&1
-docker create --name "$CNT" -p 8000:8000 "$IMG" >/dev/null || { bad "create 실패"; exit 1; }
+if command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:"$HOST_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+  bad "호스트 포트 $HOST_PORT 이 이미 사용 중이다. PREFLIGHT_PORT=19000 bash scripts/preflight.sh 로 바꿔 실행하라"
+  exit 1
+fi
+docker create --name "$CNT" -p "$HOST_PORT":8000 "$IMG" >/dev/null || { bad "create 실패"; exit 1; }
 docker start --attach "$CNT" >"$LOGF" 2>&1 &
 ATTACH_PID=$!
 
@@ -79,23 +89,29 @@ for i in $(seq 1 40); do
   RUNNING=$(docker inspect -f '{{.State.Running}}' "$CNT" 2>/dev/null)
   if [ "$RUNNING" != "true" ]; then
     CODE=$(docker inspect -f '{{.State.ExitCode}}' "$CNT" 2>/dev/null)
-    bad "컨테이너가 죽었다 — exit $CODE  ← 평가에서 나던 바로 그 실패다"
+    if [ "$CODE" = "128" ]; then
+      bad "도커가 컨테이너를 못 띄웠다 (exit 128) — 앱 문제가 아니라 환경 문제다"
+      echo "     대개 포트 충돌이다. 아래로 정리하고 다시 실행하라:"
+      echo "       docker ps -q | xargs -r docker stop"
+    else
+      bad "컨테이너가 죽었다 — exit $CODE  ← 평가에서 나던 바로 그 실패다"
+    fi
     echo "     ── 컨테이너 로그 ──"; sed 's/^/     /' "$LOGF"
     exit 1
   fi
-  if curl -sf -m 2 http://localhost:8000/health >/dev/null 2>&1; then UP=1; break; fi
+  if curl -sf -m 2 http://localhost:$HOST_PORT/health >/dev/null 2>&1; then UP=1; break; fi
 done
 [ "$UP" = 1 ] && ok "기동 ${i}초 · /health 200 · 컨테이너 살아있음" \
               || { bad "40초 안에 응답이 없다"; sed 's/^/     /' "$LOGF"; exit 1; }
 
 # ── 3. 필수 엔드포인트 ────────────────────────────────────────
 say "3. 필수 엔드포인트 (제출 규정)"
-curl -sf -m 10 http://localhost:8000/v1/models >/dev/null \
+curl -sf -m 10 http://localhost:$HOST_PORT/v1/models >/dev/null \
   && ok "GET /v1/models" || bad "GET /v1/models 실패"
 
 REQ='{"model":"Lunit/L2-preview","messages":[{"role":"user","content":"타이레놀 성인 1회 최대 용량이 얼마인가요"}]}'
 RESP=$(curl -sf -m 120 -H 'content-type: application/json' -d "$REQ" \
-        http://localhost:8000/v1/chat/completions 2>/dev/null)
+        http://localhost:$HOST_PORT/v1/chat/completions 2>/dev/null)
 if [ -n "$RESP" ]; then
   LEN=$(printf '%s' "$RESP" | python3 -c 'import json,sys;print(len(json.load(sys.stdin)["choices"][0]["message"]["content"]))' 2>/dev/null)
   if [ "${LEN:-0}" -gt 20 ]; then ok "POST /v1/chat/completions — 응답 ${LEN}자"
@@ -109,7 +125,7 @@ say "4. 동시 요청 10건 — 평가자와 같은 부하"
 for n in $(seq 1 10); do
   curl -sf -m 150 -H 'content-type: application/json' \
     -d '{"model":"Lunit/L2-preview","messages":[{"role":"user","content":"감기에 좋은 방법 알려줘"}]}' \
-    http://localhost:8000/v1/chat/completions -o "$WORK/r$n.json" &
+    http://localhost:$HOST_PORT/v1/chat/completions -o "$WORK/r$n.json" &
 done
 wait
 GOOD=0
