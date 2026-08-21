@@ -117,14 +117,21 @@ async def generate(
     # (도구를 주기만 하면 L2 가 검색을 건너뛰고 [1] 인용을 지어내던 문제도 같이 사라진다.
     #  이제 검색 여부는 모델이 아니라 라우터가 정한다.)
     query = (route.search_query or "").strip() or _last_user(messages)
+    _ctx = route.search_ctx() if hasattr(route, "search_ctx") else {}
+    # 라우터가 두 언어를 실제로 만들어 냈는지 보이게 한다. 비어 있으면 언어 계약이
+    # 통째로 무력해지는데, 로그가 없으면 그 사실을 알 수 없다.
+    log.info("route ctx: %s", {k: (v[:40] if isinstance(v, str) else v) for k, v in _ctx.items() if v})
     result = await run_retrieval(
         query, route.tools, call_fm, mcp, budget=budget,
         deadline=deadline, reserve=reserve,
+        # 도구마다 필요한 언어가 달라서, 라우터가 만들어 둔 한/영 변형을 같이 넘긴다.
+        ctx=route.search_ctx() if hasattr(route, "search_ctx") else None,
     )
     log.info(
         "retrieval: status=%s items=%d calls=%d q=%r",
         result.status, len(result.items), result.tool_calls_used, query[:80],
     )
+    log.info("retrieval trace: %s", " | ".join(result.trace)[:400])
 
     # 근거는 마지막 사용자 발화 바로 앞에 끼워 넣는다. tool 메시지로 주려면
     # tool_call_id 짝을 맞춰야 하는데, 평범한 컨텍스트로 줘도 모델은 똑같이 읽는다.

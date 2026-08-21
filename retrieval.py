@@ -25,6 +25,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from budget import call_cap
+from toolspec import call_key, normalize_args
+
+# 도구 언어 계약을 적용할 것인가. 0 이면 모델이 낸 인자를 그대로 쓴다(A/B 용).
+TOOLSPEC_NORMALIZE = os.environ.get("TOOLSPEC_NORMALIZE", "1") == "1"
 
 log = logging.getLogger("retrieval")
 
@@ -254,6 +258,7 @@ async def run_retrieval(
     step_tokens: int = 900,
     deadline=None,
     reserve: float = 25.0,
+    ctx: dict | None = None,
 ) -> RetrievalResult:
     """retrieval 단계 — 도구를 돌려 근거를 모으고 cite_uid 를 확정한다.
 
@@ -285,6 +290,10 @@ async def run_retrieval(
         {"role": "user", "content": query},
     ]
     harvested: dict[str, Evidence] = {}
+    ctx = ctx or {}
+    # 같은 요청 안에서 같은 호출을 두 번 하지 않는다. 모델이 같은 도구를 조금씩
+    # 다른 표현으로 반복해 부르는 것을 실측에서 봤고, 그건 예산만 태운다.
+    done: set[str] = set()
 
     # budget 은 **실제 MCP 도구 호출 수**다. 예전에는 이 값이 FM 왕복 수였고,
     # 모델이 한 스텝에 도구를 3개 부르면 예산 3에 9번이 나갔다. 이름과 주석은
@@ -343,10 +352,34 @@ async def run_retrieval(
             # 한 스텝에 도구를 여러 개 부를 수 있다. 예산이나 시간을 이미 썼으면
             # 실제로는 부르지 않는다 — 다만 tool 응답 자체는 반드시 채워 넣는다.
             # tool_call 하나에 짝이 되는 tool 메시지가 없으면 다음 스텝 요청이 400 이다.
+            # ── 인자를 도구의 언어 계약에 맞춘다 ──────────────────
+            # 21종은 코퍼스 언어가 제각각이고 한 도메인 서브셋 안에서도 갈린다.
+            # 틀린 언어로 부르면 0건이 오는데 비용은 성공한 호출과 똑같다.
+            # 맞출 수 없으면 부르지 않는 편이 예산에 이득이다.
+            if TOOLSPEC_NORMALIZE:
+                before = dict(args)
+                args, skip = normalize_args(fn, args, ctx)
+                changed = {k: v for k, v in args.items() if before.get(k) != v}
+                if changed:
+                    # 무엇을 왜 바꿨는지 보이지 않으면 이 계약이 맞는지 나중에 검증할 수 없다.
+                    log.info(
+                        "인자 보정 %s: %s",
+                        fn,
+                        json.dumps(changed, ensure_ascii=False)[:200],
+                    )
+            else:
+                skip = None
+            key = call_key(fn, args)
+            if not skip and key in done:
+                skip = "같은 인자로 이미 불렀다"
+
             out_of_budget = res.tool_calls_used >= budget
             out_of_time = deadline is not None and deadline.expired(reserve=reserve)
-            if out_of_budget or out_of_time:
-                why = "tool budget exhausted" if out_of_budget else "time budget exhausted"
+            if skip or out_of_budget or out_of_time:
+                why = (
+                    skip
+                    or ("tool budget exhausted" if out_of_budget else "time budget exhausted")
+                )
                 res.trace.append(f"{fn}(skipped: {why})")
                 messages.append(
                     {
@@ -358,6 +391,7 @@ async def run_retrieval(
                 continue
 
             res.tool_calls_used += 1
+            done.add(key)
             res.trace.append(f"{fn}({json.dumps(args, ensure_ascii=False)[:120]})")
             try:
                 payload = await mcp.call_tool(
