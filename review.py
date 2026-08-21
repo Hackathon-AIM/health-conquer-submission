@@ -66,7 +66,11 @@ REVIEW_RESERVE_S = float(os.environ.get("REVIEW_RESERVE_S", "2"))
 REVIEW_MAX_TOKENS = int(os.environ.get("REVIEW_MAX_TOKENS", "4096"))
 
 # 답변 길이 상한. 이보다 길면 대개 반복으로 붕괴한 경우다.
-MAX_CHARS = int(os.environ.get("REVIEW_MAX_CHARS", "6000"))
+# A 6,000-character cap removed useful late-answer coverage in 23/80 local
+# conquer_val responses.  Paired rubric grading favored preserving the answer
+# (13 wins / 7 losses / 3 ties), including after outlier trimming.  Keep a
+# generous guard for pathological output without clipping normal long answers.
+MAX_CHARS = int(os.environ.get("REVIEW_MAX_CHARS", "12000"))
 
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
 _THINK_TAG_RE = re.compile(r"</?think>", re.IGNORECASE)
