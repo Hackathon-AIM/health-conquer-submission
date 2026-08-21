@@ -170,6 +170,9 @@ class RetrievalResult:
     trace: list[str] = field(default_factory=list)
     # 무엇을 남길지는 질의에 달렸다. 압축 단계가 이 값을 조건으로 문단을 고른다.
     query: str = ""
+    # generation 단계가 다이제스트를 돌렸으면 그 결과를 여기 담아 둔다.
+    # 그래야 검증층이 생성에 실제로 들어간 근거와 같은 것을 본다.
+    rendered: str = ""
 
     def as_prompt(self, limit: int = 1400, budget: int | None = None) -> str:
         """generation 단계에 넘길 형태. 대시보드 예시의 모양을 따른다.
@@ -179,37 +182,46 @@ class RetrievalResult:
         어차피 덜 읽힌다. 그래서 질의에 맞는 문단만 골라 예산 안에 담는다.
         고르는 규칙은 compress.py 에 있다.
         """
+        if self.rendered:
+            # 다이제스트가 이미 만들어 둔 것이 있으면 그걸 쓴다.
+            return self.rendered
         budget = EVIDENCE_BUDGET_CHARS if budget is None else budget
-        lines = [f"status: {self.status}"]
-        if self.note:
-            lines.append(f"note: {self.note}")
-
-        head_room = sum(len(x) + 1 for x in lines)
+        head_room = len(self.status) + len(self.note) + 16
         packed = pack(
             self.items,
             self.query,
             budget=max(0, budget - head_room),
             per_item_cap=limit,
         )
-        for i, (ev, text) in enumerate(packed, 1):
-            lines.append("")
-            lines.append(f"[{i}]")
-            if ev.source_type:
-                lines.append(f"source_type: {ev.source_type}")
-            if ev.url:
-                lines.append(f"url: {ev.url}")
-            if ev.title:
-                lines.append(f"title: {ev.title}")
-            lines.append(f"content: {text}")
+        return render_evidence(self.status, self.note, packed, len(self.items))
 
-        dropped = len(self.items) - len(packed)
-        if dropped > 0:
-            # 조용히 자르면 모델이 받은 것이 전부라고 믿는다.
-            lines.append(
-                f"\n({dropped} more retrieved items were not included here "
-                f"because of the evidence budget.)"
-            )
-        return "\n".join(lines)
+
+def render_evidence(status: str, note: str, packed: list, total_items: int) -> str:
+    """근거 블록을 프롬프트 모양으로 만든다. 대시보드 예시의 형식을 따른다.
+
+    추출 경로와 다이제스트 경로가 같은 형식을 쓰도록 여기 하나만 둔다.
+    """
+    lines = [f"status: {status}"]
+    if note:
+        lines.append(f"note: {note}")
+    for i, (ev, text) in enumerate(packed, 1):
+        lines.append("")
+        lines.append(f"[{i}]")
+        if getattr(ev, "source_type", ""):
+            lines.append(f"source_type: {ev.source_type}")
+        if getattr(ev, "url", ""):
+            lines.append(f"url: {ev.url}")
+        if getattr(ev, "title", ""):
+            lines.append(f"title: {ev.title}")
+        lines.append(f"content: {text}")
+    dropped = total_items - len(packed)
+    if dropped > 0:
+        # 조용히 자르면 모델이 받은 것이 전부라고 믿는다.
+        lines.append(
+            f"\n({dropped} more retrieved items were not included here "
+            f"because of the evidence budget.)"
+        )
+    return "\n".join(lines)
 
 
 def to_openai_tools(mcp_tools: list[dict], names: list[str]) -> list[dict]:

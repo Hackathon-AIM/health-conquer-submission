@@ -14,7 +14,8 @@ import logging
 from typing import Any
 
 from budget import answer_timeout, call_cap
-from retrieval import RetrievalResult, run_retrieval
+from digest import DIGEST_MODE, digest
+from retrieval import EVIDENCE_BUDGET_CHARS, RetrievalResult, render_evidence, run_retrieval
 
 log = logging.getLogger("generation")
 
@@ -131,6 +132,26 @@ async def generate(
         "retrieval: status=%s items=%d calls=%d q=%r",
         result.status, len(result.items), result.tool_calls_used, query[:80],
     )
+    # 추출로 안 줄어드는 크기가 왔고 시간이 있으면, 청크를 **병렬로** 한 라운드
+    # 요약한다. 순차 refine 이 아니라 map 인 이유는 벽시계 때문이다 — 순차면
+    # 호출 수만큼 지연이 쌓이고, 이 저장소에서 지연은 곧 점수다.
+    if DIGEST_MODE != "off" and result.items:
+        try:
+            head = len(result.status) + len(result.note) + 16
+            packed, n_calls = await digest(
+                result.items,
+                query,
+                budget=max(0, EVIDENCE_BUDGET_CHARS - head),
+                call_fm=call_fm,
+                deadline=deadline,
+            )
+            if n_calls:
+                result.rendered = render_evidence(
+                    result.status, result.note, packed, len(result.items)
+                )
+        except Exception as e:  # noqa: BLE001 — 요약이 죽어도 근거는 있어야 한다
+            log.warning("다이제스트 실패: %s: %s", type(e).__name__, str(e)[:200])
+
     _ev = result.as_prompt()
     log.info(
         "retrieval trace: %s",
