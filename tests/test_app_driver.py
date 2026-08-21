@@ -186,6 +186,42 @@ class AppDriverTests(unittest.TestCase):
 
         self.assertIsNone(route)
 
+    def test_mcp_gate_does_not_treat_source_as_evidence_by_itself(self) -> None:
+        route = driver_app._mcp_route([
+            {"role": "user", "content": "What is the source of my lower back pain?"},
+        ])
+
+        self.assertIsNone(route)
+
+    def test_generate_reply_uses_direct_token_cap(self) -> None:
+        calls: list[int] = []
+
+        async def fake_call_fm(
+            _messages: list[dict[str, Any]],
+            max_tokens: int,
+            _extra: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            calls.append(max_tokens)
+            return {
+                "choices": [{
+                    "message": {"content": "짧은 답변"},
+                    "finish_reason": "stop",
+                }]
+            }
+
+        original = driver_app.call_fm
+        driver_app.call_fm = fake_call_fm
+        try:
+            answer = asyncio.run(driver_app.generate_reply(
+                [{"role": "user", "content": "감기 기운이 있어요"}],
+                Deadline.start(40),
+            ))
+        finally:
+            driver_app.call_fm = original
+
+        self.assertEqual(answer, "짧은 답변")
+        self.assertEqual(calls, [driver_app.DIRECT_MAX_TOKENS])
+
     def test_optional_mcp_uses_direct_path_for_non_gate_question(self) -> None:
         async def fake_generate_reply(
             _messages: list[dict[str, Any]],

@@ -44,6 +44,8 @@ PUBLIC_MODEL = os.environ.get("HARNESS_MODEL_NAME", "medai")
 # 서버가 max_tokens 2048 을 넘기면 400 (`output_limit_exceeded`) 을 던진다. 이건 상한이다.
 SERVER_MAX_TOKENS = 2048
 MAX_TOKENS = min(int(os.environ.get("FM_MAX_TOKENS", "2048")), SERVER_MAX_TOKENS)
+DIRECT_MAX_TOKENS = min(int(os.environ.get("FM_DIRECT_MAX_TOKENS", "1100")), SERVER_MAX_TOKENS)
+MCP_FINAL_MAX_TOKENS = min(int(os.environ.get("FM_MCP_FINAL_MAX_TOKENS", "900")), SERVER_MAX_TOKENS)
 TIMEOUT = float(os.environ.get("FM_TIMEOUT", "120"))
 FM_RETRIES = int(os.environ.get("FM_RETRIES", "3"))
 FM_BACKOFF = float(os.environ.get("FM_BACKOFF", "1.5"))
@@ -76,12 +78,12 @@ ENABLE_THINKING = os.environ.get("FM_THINKING", "0") == "1"
 # separate system message. Keep this deliberately narrow: it prevents a generic
 # referral from replacing an otherwise answerable medical response.
 ANSWER_INSTRUCTION = (
-    "Do not substitute 'consult a professional' for an answer; answer as far as you can."
+    "Answer directly and concisely. Do not give a referral-only answer."
 )
 
 _EVIDENCE_RE = re.compile(
     r"(근거|출처|인용|논문|연구|가이드라인|지침|공식|문헌|reference|citation|"
-    r"evidence|source|guideline|study|paper|trial|peer[- ]reviewed|systematic\s+review|"
+    r"evidence|guideline|study|paper|trial|peer[- ]reviewed|systematic\s+review|"
     r"meta[- ]analysis|official\s+(?:source|label|document|guidance))",
     re.I,
 )
@@ -146,8 +148,15 @@ async def lifespan(_: FastAPI):
     if not FM_KEY:
         log.error("LUNIT_FM_API_KEY 가 비어 있다. 모든 생성 요청이 실패한다.")
     log.info(
-        "driver up — model=%s max_tokens=%d thinking=%s budget=%.0fs fm_conc=%d mcp_conc=%d",
-        FM_MODEL, MAX_TOKENS, ENABLE_THINKING, REQUEST_BUDGET_S, FM_CONCURRENCY, MCP_CONCURRENCY,
+        "driver up — model=%s max_tokens=%d direct_tokens=%d mcp_final_tokens=%d thinking=%s budget=%.0fs fm_conc=%d mcp_conc=%d",
+        FM_MODEL,
+        MAX_TOKENS,
+        DIRECT_MAX_TOKENS,
+        MCP_FINAL_MAX_TOKENS,
+        ENABLE_THINKING,
+        REQUEST_BUDGET_S,
+        FM_CONCURRENCY,
+        MCP_CONCURRENCY,
     )
     try:
         yield
@@ -312,7 +321,7 @@ async def answer_with_optional_mcp(messages: list[dict], dl: Deadline) -> str:
             route,
             call_fm,
             MCP,
-            MAX_TOKENS,
+            MCP_FINAL_MAX_TOKENS,
             budget=RETRIEVAL_BUDGET,
             deadline=dl,
             reserve=ANSWER_RESERVE_S,
@@ -382,7 +391,7 @@ async def generate_reply(messages: list[dict], dl: Deadline) -> str:
     try:
         data = await call_fm(
             forwarded,
-            MAX_TOKENS,
+            DIRECT_MAX_TOKENS,
             {"chat_template_kwargs": {"enable_thinking": True}},
         )
     except Exception as e:  # noqa: BLE001 - 실패한 thinking 호출보다 완성 답변이 중요하다.
@@ -393,7 +402,7 @@ async def generate_reply(messages: list[dict], dl: Deadline) -> str:
         )
         data = await call_fm(
             forwarded,
-            MAX_TOKENS,
+            DIRECT_MAX_TOKENS,
             {"chat_template_kwargs": {"enable_thinking": False}},
         )
         content = _choice_content(data)
@@ -412,7 +421,7 @@ async def generate_reply(messages: list[dict], dl: Deadline) -> str:
         )
         data = await call_fm(
             forwarded,
-            MAX_TOKENS,
+            DIRECT_MAX_TOKENS,
             {"chat_template_kwargs": {"enable_thinking": False}},
         )
         content = _choice_content(data)
@@ -438,7 +447,7 @@ async def chat_completions(body: dict) -> dict[str, Any]:
             data = await asyncio.wait_for(
                 call_fm(
                     _messages_with_answer_instruction(messages),
-                    MAX_TOKENS,
+                    DIRECT_MAX_TOKENS,
                     {"chat_template_kwargs": {"enable_thinking": False}},
                 ),
                 timeout=60,

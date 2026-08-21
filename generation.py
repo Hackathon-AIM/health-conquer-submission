@@ -64,8 +64,8 @@ How to answer:
 - Retrieval was enabled only because this question matched a narrow external-evidence gate:
   evidence/source requests, policy/law/code/price questions, specific drug-label facts, or
   claim-check/statistics questions. Do not broaden the answer beyond that need.
-- Be complete enough to be useful, then stop. Length is not a virtue here; a tight answer beats a
-  long one. Do not restate the question or add filler openers.
+- Lead with the answer, then give only the key caveat or evidence. Prefer 3-6 concise sentences
+  unless the user explicitly asks for detail. Do not restate the question or add filler openers.
 - Answer in {lang_name}.
 {extra}"""
 
@@ -126,7 +126,8 @@ async def generate(
             "role": "system",
             "content": (
                 "Retrieved evidence for this question. Cite these as [1], [2] and cite "
-                "nothing else. If they do not answer it, say so.\n\n" + result.as_prompt()
+                "nothing else. Answer briefly; if they do not answer it, say so in one sentence.\n\n"
+                + result.as_prompt()
             ),
         },
     )
