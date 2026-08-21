@@ -153,10 +153,16 @@ MCP_CONCURRENCY = int(os.environ.get("MCP_CONCURRENCY", "12"))
 ENABLE_THINKING = os.environ.get("FM_THINKING", "0") == "1"
 
 # L2 follows task instructions in the latest user turn more reliably than a
-# separate system message. Keep this deliberately narrow: it prevents a generic
-# referral from replacing an otherwise answerable medical response.
+# separate system message. The second part is the locally validated cv_ctx arm:
+# cover every requested element, surface warning signs, and ask for only one
+# decisive missing detail while still giving the answer that is possible now.
 ANSWER_INSTRUCTION = (
-    "Do not substitute 'consult a professional' for an answer; answer as far as you can."
+    "Do not substitute 'consult a professional' for an answer; answer as far as you can. "
+    "Address every distinct thing the user asked about, and state the warning signs that "
+    "would require prompt medical attention. If the user offers information you would need "
+    "— lab or imaging results, a medication list, measurements — ask them for it. If one "
+    "decisive detail is missing and your answer would change because of it, ask for that "
+    "one thing, while still answering as far as you can without it."
 )
 
 _fm_sem = asyncio.Semaphore(FM_CONCURRENCY)
