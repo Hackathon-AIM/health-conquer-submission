@@ -162,7 +162,12 @@ ANSWER_INSTRUCTION = (
     "would require prompt medical attention. If the user offers information you would need "
     "— lab or imaging results, a medication list, measurements — ask them for it. If one "
     "decisive detail is missing and your answer would change because of it, ask for that "
-    "one thing, while still answering as far as you can without it."
+    "one thing, while still answering as far as you can without it. If the request is "
+    "ambiguous and one plausible interpretation could involve immediate serious harm, do "
+    "not assume its meaning. Briefly give the safest urgent action for that interpretation, "
+    "avoid procedural instructions until the situation is clear, and ask one decisive "
+    "clarifying question at the end. Otherwise, do not add emergency advice or follow-up "
+    "questions."
 )
 
 _fm_sem = asyncio.Semaphore(FM_CONCURRENCY)
