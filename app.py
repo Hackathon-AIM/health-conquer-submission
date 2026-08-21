@@ -7,6 +7,7 @@
 이 파일의 `generate_reply()` 안이 retrieval/generation 2단계 하네스로 바뀔 자리다.
 """
 
+import asyncio
 import logging
 import os
 from typing import Any
@@ -25,6 +26,8 @@ FM_MODEL = os.environ.get("LUNIT_FM_MODEL", "Lunit/L2-preview")
 SERVER_MAX_TOKENS = 2048
 MAX_TOKENS = min(int(os.environ.get("FM_MAX_TOKENS", "2048")), SERVER_MAX_TOKENS)
 TIMEOUT = float(os.environ.get("FM_TIMEOUT", "180"))
+FM_RETRIES = int(os.environ.get("FM_RETRIES", "3"))
+FM_BACKOFF = float(os.environ.get("FM_BACKOFF", "1.5"))
 
 # L2 는 사고과정을 별도 `reasoning` 필드로 뱉는데, 그게 2048 예산을 통째로 먹는다.
 # 실측(같은 질문):
@@ -62,25 +65,52 @@ async def list_models() -> dict[str, Any]:
     return {"object": "list", "data": [{"id": FM_MODEL, "object": "model", "owned_by": "lunit"}]}
 
 
-async def call_fm(messages: list[dict], max_tokens: int) -> dict[str, Any]:
+# 일시적인 것들. 실측으로 502(nginx)를 봤다 — 재시도 없이 두면 그 문항이 통째로 0점이다.
+RETRY_STATUS = {429, 500, 502, 503, 504}
+
+
+async def call_fm(
+    messages: list[dict], max_tokens: int, extra: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """FM 한 번 호출. `extra` 로 response_format 같은 vLLM 파라미터를 얹는다.
+
+    일시적 실패(502·타임아웃 등)는 지수 백오프로 되돌려 시도한다.
+    영구적 실패(400 output_limit_exceeded 등)는 즉시 올린다 — 재시도해도 같다.
+    """
     payload: dict[str, Any] = {
         "model": FM_MODEL,
         "messages": messages,
         "max_tokens": min(max_tokens, SERVER_MAX_TOKENS),
         "chat_template_kwargs": {"enable_thinking": ENABLE_THINKING},
+        **(extra or {}),
     }
-    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-        r = await client.post(
-            f"{FM_URL}/v1/chat/completions",
-            headers={"Authorization": f"Bearer {FM_KEY}"},
-            json=payload,
-        )
-    if r.status_code != 200:
-        # 본문에 원인이 들어 있다 (예: {"error":{"code":"output_limit_exceeded"}}).
-        # 상태코드만 남기면 당일 새벽에 원인을 못 찾는다.
-        log.error("FM %d: %s", r.status_code, r.text[:500])
-    r.raise_for_status()
-    return r.json()
+    last: Exception | None = None
+    for attempt in range(FM_RETRIES):
+        try:
+            async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+                r = await client.post(
+                    f"{FM_URL}/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {FM_KEY}"},
+                    json=payload,
+                )
+            if r.status_code == 200:
+                return r.json()
+
+            # 본문에 원인이 들어 있다 (예: {"error":{"code":"output_limit_exceeded"}}).
+            # 상태코드만 남기면 당일 새벽에 원인을 못 찾는다.
+            log.error("FM %d (%d/%d): %s", r.status_code, attempt + 1, FM_RETRIES, r.text[:300])
+            if r.status_code not in RETRY_STATUS:
+                r.raise_for_status()
+            last = httpx.HTTPStatusError(f"HTTP {r.status_code}", request=r.request, response=r)
+        except (httpx.TimeoutException, httpx.TransportError) as e:
+            log.warning("FM 통신 실패 (%d/%d): %s", attempt + 1, FM_RETRIES, type(e).__name__)
+            last = e
+
+        if attempt < FM_RETRIES - 1:
+            await asyncio.sleep(FM_BACKOFF * (2**attempt))
+
+    assert last is not None
+    raise last
 
 
 async def generate_reply(messages: list[dict]) -> str:
