@@ -176,11 +176,15 @@ class Pipeline:
                          "반드시 함께 안내하세요.")
         return "\n".join(f"- {x}" for x in lines)
 
-    async def node_l4(self, text, plan, ctx, session, input_hits, red_flag) -> str:
+    async def node_l4(self, text, plan, ctx, session, input_hits, red_flag,
+                      deadline=None) -> str:
         """L4 · 초안 생성 + 🚨 응급 응답 빌더."""
         if self.l2 is not None:
             # L2 2단계 경로 — 검색은 L2 가 retrieve_relevant_content 로 스스로 한다
             query = await self._l2_query(text, session)
+            # 분류에 쓴 시간을 빼고 남은 만큼만 L2 에게 준다
+            if deadline is not None:
+                self.l2.request_budget_s = max(6.0, deadline - time.perf_counter())
             answer = await self.l2.generate(
                 query,
                 intent=plan.intent,
@@ -249,6 +253,8 @@ class Pipeline:
         if self.l2 is not None:
             # L2 네이티브 베이스라인 — 권장 2단계 사용법 그대로, 우리 레이어 없이.
             query = await self._l2_query(text, session)
+            self.l2.request_budget_s = float(
+                (self.cfg.get("l2") or {}).get("request_budget_s", 40.0))
             answer = await self.l2.generate(query)
         else:
             msgs = [{"role": "system",
@@ -270,7 +276,12 @@ class Pipeline:
 
         t_start = time.perf_counter()
         lat: dict[str, int] = {}
-        deadline = t_start + float(self.cfg["generation"].get("total_budget_sec", 20.0))
+        # ★ 요청 하나의 총 마감. 늦은 답은 채점에서 없는 답과 같다
+        #   (팀 실측: 예산 75초로 돌린 trial 이 0.00 을 받았다).
+        #   분류·안전게이트도 이 예산을 같이 쓰므로 L2 에게는 남은 시간만 준다.
+        budget = float((self.cfg.get("l2") or {}).get(
+            "request_budget_s", self.cfg["generation"].get("total_budget_sec", 40.0)))
+        deadline = t_start + budget
 
         def mark(k: str, t0: float) -> None:
             lat[k] = int((time.perf_counter() - t0) * 1000)
@@ -295,7 +306,8 @@ class Pipeline:
 
         # L4
         t = time.perf_counter()
-        answer = await self.node_l4(text, plan, ctx, session, input_hits, red_flag)
+        answer = await self.node_l4(text, plan, ctx, session, input_hits, red_flag,
+                                    deadline)
         mark("l4", t)
 
         # L4b — 모델이 '추천한' 약을 검증

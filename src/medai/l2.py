@@ -294,6 +294,9 @@ class L2Harness:
         self.max_items = int(l2c.get("max_evidence_items", 6))
         self.tool_result_chars = int(l2c.get("tool_result_chars", 3000))
         self.retrieval_budget = int(l2c.get("retrieval_char_budget", 24000))
+        self.request_budget_s = float(l2c.get("request_budget_s", 40.0))
+        self.answer_reserve_s = float(l2c.get("answer_reserve_s", 18.0))
+        self._deadline: Optional[float] = None      # 이번 요청의 마감 시각
         self.trace: dict[str, Any] = {}
 
     # ── 저수준: tool 지원 chat 호출 (llm.chat 은 tools 를 모른다) ──
@@ -348,6 +351,9 @@ class L2Harness:
         called_tools: list = []             # 실제로 부른 MCP 도구 (E2E 검증용)
 
         while calls < self.max_tool_calls:
+            if self._out_of_time():
+                self.trace["retrieval_timeout"] = True
+                break          # 모은 것으로 즉시 마감한다
             msg = await self._chat_tools(msgs, tools)
             if not msg.tool_calls:
                 # 도구 없이 말로 끝내려 한다 → finalize 를 강제한다
@@ -480,6 +486,19 @@ class L2Harness:
         return {"status": selection.get("status", "partial"),
                 "note": selection.get("note", ""), "blocks": blocks}
 
+    # ── 시간 예산 ───────────────────────────────────────────
+    #
+    # ★ 늦은 답 = 없는 답. 팀 실측에서 예산 75초로 돌린 trial 이 0.00 을 받았다.
+    #   그래서 검색을 '충분히' 하는 것보다 '제때 끊는' 것이 점수에 낫다.
+    def _search_left(self) -> float:
+        """검색에 아직 쓸 수 있는 초. 답변 생성 몫은 미리 떼어 둔다."""
+        if self._deadline is None:
+            return 1e9
+        return self._deadline - self.answer_reserve_s - time.perf_counter()
+
+    def _out_of_time(self) -> bool:
+        return self._search_left() <= 0
+
     # ── 근거 강제 판정 ──────────────────────────────────────
     #
     # ★ 이 해커톤에서 MCP 는 도구가 아니라 **RAG 그 자체**다.
@@ -541,6 +560,7 @@ class L2Harness:
                       이게 없으면 분류 결과가 계산만 되고 버려진다.
         """
         self.trace = {}
+        self._deadline = time.perf_counter() + self.request_budget_s
         sys = prompt("l2_generation.txt")
         if context_note:
             sys += f"\n\n[대화 맥락 요약 — 답변에 반영하세요]\n{context_note}"
@@ -557,7 +577,9 @@ class L2Harness:
         #   지어냈다. 프롬프트만으로는 못 막는다 — 첫 호출을 하네스가 강제한다.
         #   가이드도 "retrieval 과 generation 을 잇는 방식은 자유"라고 했다.
         forced_ok = False
-        if intent is not Intent.EMERGENCY and self._needs_evidence(user_query, intent):
+        if (intent is not Intent.EMERGENCY
+                and not self._out_of_time()
+                and self._needs_evidence(user_query, intent)):
             r0 = await self._safe_retrieval(user_query, intent)
             self.trace["forced_retrieval"] = True
             if r0["blocks"]:
@@ -602,7 +624,7 @@ class L2Harness:
                     q = json.loads(tc.function.arguments or "{}").get("query", user_query)
                 except Exception:
                     q = user_query
-                if retrievals < self.max_retrievals:
+                if retrievals < self.max_retrievals and not self._out_of_time():
                     retrievals += 1
                     # ★ 검색이 실패해도 답변은 나와야 한다.
                     #   MCP 가 막혀 있거나(격리 환경) 도구가 죽어도 여기서 예외가

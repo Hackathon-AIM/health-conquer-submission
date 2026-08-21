@@ -55,6 +55,7 @@ _PIPE: Pipeline | None = None
 _CFG = None
 _LOOP: asyncio.AbstractEventLoop | None = None
 _INIT_ERROR: str = ""      # 초기화 실패 사유 (축소 모드일 때만 채워진다)
+_REQ_N = 0                 # 받은 요청 수 — 평가자가 우리한테 오긴 했는지의 증거
 
 
 # ─────────────────────────────────────────────────────────────
@@ -130,6 +131,18 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):   # 기본 stderr 로깅 억제
         pass
 
+    def log_request(self, code="-", size="-"):
+        """★ 들어온 요청을 stdout 에 남긴다.
+
+        평가자는 컨테이너 stdout 을 로그로 보여준다. 우리가 죽었는지,
+        아니면 평가자가 애초에 우리한테 연결조차 안 했는지를 가르는 유일한 증거다.
+        (실측: CoEval 이 exit 1 로 죽는데 우리 서버는 멀쩡히 떠 있었다 —
+         요청이 0건이면 저쪽이 우리한테 오지도 않은 것이다.)
+        """
+        global _REQ_N
+        _REQ_N += 1
+        _say(f"  [요청 #{_REQ_N}] {self.command} {self.path} → {code}")
+
     def _send(self, code: int, obj: dict) -> None:
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
@@ -182,6 +195,10 @@ class Handler(BaseHTTPRequestHandler):
                       "증상이 지속되거나 악화되면 가까운 의료기관에서 진료를 받아보세요.")
             trace = {"error": repr(e)}
 
+        r_ = ((trace or {}).get("l2") or {}).get("retrieval") or {}
+        _say(f"      └ 턴 처리 완료 · {len(answer)}자"
+             + (f" · 검색 {r_.get('tool_calls')}회/{r_.get('status')}" if r_ else " · 검색없음")
+             + (f" · ⚠️ {str(trace.get('error'))[:80]}" if (trace or {}).get("error") else ""))
         prompt_chars = sum(len(str(m.get("content", ""))) for m in messages)
         self._send(200, {
             "id": "chatcmpl-" + uuid.uuid4().hex[:24],
@@ -206,6 +223,29 @@ class Handler(BaseHTTPRequestHandler):
 def _run_loop(loop: asyncio.AbstractEventLoop) -> None:
     asyncio.set_event_loop(loop)
     loop.run_forever()
+
+
+def _env_str(name: str, default: str) -> str:
+    """빈 값·공백을 '없음'으로 취급한다. os.getenv 의 기본값은 빈 문자열에 안 먹는다."""
+    return (os.getenv(name) or "").strip() or default
+
+
+def _env_int(name: str, default: int) -> int:
+    """숫자가 아니면 기본값으로 — 여기서 터지면 배너 한 줄도 못 찍고 exit 1 이다.
+
+    ⚠️ 이 파싱은 main() 의 try/except 보다 앞이라 예외가 그대로 프로세스를 죽인다.
+       Dockerfile 의 ENV 가 빌더에 따라 "8000 # 주석" 처럼 오염되면 여기서 끝난다.
+    """
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    import re as _re
+    m = _re.search(r"\d+", raw)     # "8000 # ..." 같은 오염도 살려낸다
+    try:
+        v = int(m.group(0)) if m else default
+    except Exception:
+        return default
+    return v if 1 <= v <= 65535 else default
 
 
 def _say(*parts: object) -> None:
@@ -294,9 +334,9 @@ def main() -> None:
     # ★ 제출 규정: 컨테이너는 수동 작업 없이 0.0.0.0:8000 에서 서비스해야 한다.
     #   그래서 기본값을 8000 / configs/l2_live.yaml 로 두고, 환경변수로 덮을 수 있게 한다.
     #   (Dockerfile 의 CMD 는 인자 없이 `python serve.py` 만 부른다)
-    ap.add_argument("--config", default=os.getenv("MEDAI_CONFIG", "configs/l2_live.yaml"))
-    ap.add_argument("--host", default=os.getenv("HOST", "0.0.0.0"))
-    ap.add_argument("--port", type=int, default=int(os.getenv("PORT", "8000")))
+    ap.add_argument("--config", default=_env_str("MEDAI_CONFIG", "configs/l2_live.yaml"))
+    ap.add_argument("--host", default=_env_str("HOST", "0.0.0.0"))
+    ap.add_argument("--port", type=int, default=_env_int("PORT", 8000))
     a = ap.parse_args()
 
     # ★ 초기화가 실패해도 서버는 뜬다.
@@ -365,4 +405,24 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # ★ 최후 방어. main() 이 어떤 이유로 터지든 컨테이너가 죽으면 제출물은 0점이다.
+    #   (docker start --attach 가 non-zero 를 반환 → 평가 실패)
+    #   그래서 실패하면 "아무것도 못 하는 서버"라도 8000 을 열어 두고,
+    #   원인은 stdout 에 남긴다 — 평가 로그가 곧 우리의 유일한 디버거다.
+    try:
+        main()
+    except SystemExit:
+        raise
+    except BaseException:
+        traceback.print_exc()
+        _say("!" * 66)
+        _say("  ⚠️  main() 실패 — 최소 응답 서버로 전환합니다")
+        _say("!" * 66)
+        try:
+            srv = ThreadingHTTPServer(("0.0.0.0", 8000), Handler)
+            srv.serve_forever()
+        except BaseException:
+            traceback.print_exc()
+            # 그래도 안 되면 프로세스는 살려 둔다 (죽는 것보다 낫다)
+            while True:
+                time.sleep(3600)

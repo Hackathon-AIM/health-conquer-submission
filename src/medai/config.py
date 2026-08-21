@@ -60,6 +60,14 @@ DEFAULTS: dict[str, Any] = {
     # ── L2 2단계 하네스 (대회 FM 권장 사용법 — src/medai/l2.py) ──
     "l2": {
         "mcp_url": "https://mcp.hackathon.lunit.io/mcp",
+        # ★ 요청 하나에 쓸 수 있는 총 시간 — 이걸 넘기면 점수가 0 이 된다.
+        #   팀 실측(app.py 주석): 예산을 75초로 뒀던 trial 이 0.00 을 받았고,
+        #   같은 회차의 다른 제출물은 40점대를 받았다. 채점은 정상이었고
+        #   우리 쪽이 느려서 잘린 것이다.
+        #   → 늦은 답과 없는 답이 채점에서 같다면, 끊고 내는 편이 항상 낫다.
+        "request_budget_s": 40.0,
+        # 그중 최종 답변 생성 몫으로 떼어 두는 시간. 검색은 나머지 안에서 끝내야 한다.
+        "answer_reserve_s": 18.0,
         "max_tool_calls": 8,             # 검색 단계 도구 호출 예산 (가이드: 제한하라)
         "max_retrievals_per_turn": 2,    # 생성 단계가 retrieve 를 부를 수 있는 횟수
         # ★ 실측(data/probe/page_stats.json): 가이드라인 1페이지 = 3,929자.
