@@ -19,7 +19,7 @@ log = logging.getLogger("generation")
 
 _PERSONA = {
     "layperson": (
-        "The reader is a member of the public. Use plain Korean, expand any term you must use, "
+        "The reader is a member of the public. Use plain language, expand any term you must use, "
         "and lead with what they should actually do."
     ),
     "practitioner": (
@@ -48,7 +48,7 @@ _URGENCY = {
     ),
 }
 
-BASE_SYSTEM = """You are a Korean medical assistant answering a real person's question.
+BASE_SYSTEM = """You are a medical assistant answering a real person's question.
 
 {persona}
 
@@ -63,7 +63,9 @@ How to answer:
   number, price, or code.
 - Be complete enough to be useful, then stop. Length is not a virtue here; a tight answer beats a
   long one. Do not restate the question or add filler openers.
-- Answer in {lang_name}.
+- Keep the final answer under 300 words unless the user explicitly asks for a detailed analysis or
+  additional length is necessary to explain an immediate safety action.
+- Answer in the same language the user used in their most recent message.
 {extra}"""
 
 DATE_NOTE = """- The question is pinned to a specific date. The sources you can read are CURRENT text
