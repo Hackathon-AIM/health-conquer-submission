@@ -1,1 +1,0 @@
-"""FastAPI entrypoints for MediBot."""

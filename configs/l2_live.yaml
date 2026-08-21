@@ -1,0 +1,54 @@
+# 현장 본선 설정 — Lunit L2 + MCP + 우리 안전 레이어
+#
+# 사전 준비 (.env 에 넣는다. yaml 에 키를 쓰지 않는다):
+#   LUNIT_FM_API_KEY=lunit_...
+#
+# 실행:
+#   make serve CONFIG=configs/l2_live.yaml   # 또는 python serve.py --config configs/l2_live.yaml
+name: l2_live
+
+llm:
+  base_url: "https://model.hackathon.lunit.io/v1"
+  api_key_env: "LUNIT_FM_API_KEY"
+  timeout: 90.0            # 검색 단계가 도구를 여러 번 돌므로 넉넉히 (SDK 기본 600s 방지)
+  # ★ 엔드포인트가 502(nginx bad gateway)를 간헐적으로 낸다 — 실측 확인.
+  #   평가 중 한 번 터지면 그 문항 답변이 통째로 날아간다. SDK 는 5xx 를 재시도하므로
+  #   횟수를 늘린다. 90초 × 4회 = 최악 6분이지만 CoEval timeout 360초와 비슷한 수준이고,
+  #   실패한 답변 하나보다 느린 답변 하나가 낫다.
+  max_retries: 4
+  temperature: 0.2
+  max_tokens: 2048
+
+models:
+  # 대회 규칙: 최종 출력은 반드시 L2. 보조 역할도 전부 L2 로 통일한다 —
+  # 평가는 외부 접근이 차단된 격리 환경이라 OpenAI 등 외부 모델은 어차피 못 쓴다.
+  classifier: "Lunit/L2-preview"
+  rewriter:   "Lunit/L2-preview"
+  drafter:    "Lunit/L2-preview"   # ★ 고정 — 심사 대상 텍스트
+  critic:     "Lunit/L2-preview"
+  extractor:  "Lunit/L2-preview"
+  grader:     "Lunit/L2-preview"   # 로컬 자체 평가용. 대회 judge 는 저쪽 것
+
+layers:
+  l2_native: true          # ★ L4 를 L2 2단계(검색→생성)로. L3/rerank 자동 우회
+  redflag: true
+  entity_llm_merge: true
+  dur_input: true
+  dur_output: true
+  risk_check: true
+  critic: false            # L2 위에서의 비평 패스 효과는 미검증 — ab 로 재고 켠다
+
+l2:
+  max_tool_calls: 8
+  max_retrievals_per_turn: 2
+  # 실측(data/probe/page_stats.json): 가이드라인 1페이지 = 3,929자.
+  # 1800 이면 페이지 한 장도 절반이 잘렸다 (권고 문장은 문단 뒤쪽에 있다).
+  evidence_chars_per_item: 4000
+  max_evidence_items: 6            # 6 × 4000 ≈ 24,000자 ≈ 7,200토큰
+  # ⚠️ 아래 둘은 '검색 대화'에 누적되는 양이다. 근거 예산과 헷갈리지 말 것.
+  #    12000 으로 뒀다가 8회 누적 96,000자로 input_limit_exceeded 가 났다.
+  tool_result_chars: 3000          # 도구 결과 1건이 대화에 남는 양
+  retrieval_char_budget: 24000     # 도구 결과 총량 (넘으면 오래된 것부터 비운다)
+
+retrieval:
+  mode: mock               # L3 는 우회되지만 스모크 등이 참조하므로 mock 유지

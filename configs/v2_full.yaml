@@ -1,0 +1,11 @@
+# A/B: 전 계층 활성 (기준선)
+name: v2_full
+retrieval:
+  mode: mock
+layers:
+  redflag: true
+  entity_llm_merge: true
+  dur_input: true
+  dur_output: true
+  risk_check: true
+  critic: true
