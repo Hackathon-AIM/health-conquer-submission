@@ -25,8 +25,16 @@ from router import classify
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("driver")
 
+# 평가 환경이 키를 주입해 주는지 확인되지 않았다. 주입되지 않으면 FM 호출이 전부
+# 실패해 답이 통째로 비고, 그 채점은 0점이다 — 실측으로 Done 인데 score 0.00 을 봤다.
+# 그래서 폴백 키를 들고 간다. 환경변수가 있으면 언제나 그쪽이 이긴다.
+#
+# ⚠️ 이 키는 저장소 히스토리에 남는다. 대회가 끝나면 대시보드 /api-keys 에서
+#    'submission-eval' 키를 폐기할 것.
+_FALLBACK_KEY = "lunit_dFthkHMh2_gB2aVIo_mi5jznWpHoXbU2a2Od4hlVtf4"
+
 FM_URL = os.environ.get("LUNIT_FM_API_URL", "https://model.hackathon.lunit.io").rstrip("/")
-FM_KEY = os.environ.get("LUNIT_FM_API_KEY", "")
+FM_KEY = os.environ.get("LUNIT_FM_API_KEY", "").strip() or _FALLBACK_KEY
 FM_MODEL = os.environ.get("LUNIT_FM_MODEL", "Lunit/L2-preview")
 
 # 서버가 max_tokens 2048 을 넘기면 400 (`output_limit_exceeded`) 을 던진다. 이건 상한이다.
@@ -62,7 +70,9 @@ ENABLE_THINKING = os.environ.get("FM_THINKING", "0") == "1"
 
 _fm_sem = asyncio.Semaphore(FM_CONCURRENCY)
 _client: httpx.AsyncClient | None = None
-MCP = MCPClient(concurrency=MCP_CONCURRENCY)
+# MCP 도 같은 팀 키를 쓴다. 모듈 로드 시점의 환경변수를 각자 읽게 두면
+# 폴백이 한쪽에만 걸리므로 여기서 명시적으로 넘긴다.
+MCP = MCPClient(key=FM_KEY, concurrency=MCP_CONCURRENCY)
 
 
 @asynccontextmanager
