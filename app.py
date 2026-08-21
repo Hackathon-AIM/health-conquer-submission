@@ -339,13 +339,30 @@ def _lang_of(text: str) -> str:
     return "ko" if re.search(r"[가-힣]", text) else "en"
 
 
+# 멀티턴에서 답이 무너진다 — 실측:
+#   챔피언 자체   멀티턴 2,632자 vs 단일턴 4,859자 (54%)
+#   채점 기록     멀티턴 0.4540  vs 단일턴 0.6722  (n=442)
+# 루브릭 수는 같은데(12 vs 11) 답변만 짧다. healthbench_main 의 41.7% 가 멀티턴이다.
+#
+# 지시를 system 메시지로 옮겨봤더니 오히려 더 나빠졌다 — 멀티/단일 비율이
+# 54% → 34%. 그래서 위치는 그대로 두고(마지막 user 턴 접미) 구절만 더한다.
+MULTITURN_CLAUSE = (
+    "This is an ongoing conversation: the message above may be short or refer back to "
+    "something said earlier. Resolve what it refers to, then answer it with the same "
+    "depth you would give a standalone question — not as a brief chat reply."
+)
+
+
 def _with_answer_instruction(messages: list[dict]) -> list[dict]:
     """최신 사용자 턴에만 답변 행동 지시를 붙인다. 히스토리는 건드리지 않는다."""
     forwarded = [dict(message) for message in messages]
     if forwarded and forwarded[-1].get("role") == "user":
         content = forwarded[-1].get("content")
         if isinstance(content, str):
-            forwarded[-1]["content"] = f"{content}\n\n[{ANSWER_INSTRUCTION}]"
+            instruction = ANSWER_INSTRUCTION
+            if sum(1 for m in forwarded if m.get("role") in ("user", "assistant")) > 1:
+                instruction = f"{instruction} {MULTITURN_CLAUSE}"
+            forwarded[-1]["content"] = f"{content}\n\n[{instruction}]"
     return forwarded
 
 
