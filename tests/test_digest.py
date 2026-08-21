@@ -67,13 +67,15 @@ class FakeFM:
             self.concurrent -= 1
 
 
-def run(items, fm, budget=4000, deadline=None, mode="auto"):
-    old = D.DIGEST_MODE
+def run(items, fm, budget=4000, deadline=None, mode="auto", strategy=None):
+    old, olds = D.DIGEST_MODE, D.DIGEST_STRATEGY
     D.DIGEST_MODE = mode
+    if strategy:
+        D.DIGEST_STRATEGY = strategy
     try:
         return asyncio.run(D.digest(items, Q, budget, fm, deadline=deadline))
     finally:
-        D.DIGEST_MODE = old
+        D.DIGEST_MODE, D.DIGEST_STRATEGY = old, olds
 
 
 # ── 비용: 웬만하면 안 돈다 ────────────────────────────────────
@@ -152,6 +154,52 @@ def test_result_stays_within_budget() -> None:
     fm = FakeFM(reply="요약 " * 500)  # 요약본이 예산을 넘는 경우
     packed, calls = run([Ev(text=BULK)], fm, budget=1000, deadline=Deadline.start(40.0))
     assert sum(len(t) for _, t in packed) <= 1200, sum(len(t) for _, t in packed)
+
+
+# ── refine 전략 (순차 누적) ───────────────────────────────────
+def test_map_is_the_default_strategy() -> None:
+    assert D.DIGEST_STRATEGY == "map", "기본 전략이 map 이 아니다"
+
+
+def test_refine_runs_sequentially() -> None:
+    """refine 은 앞 요약을 봐야 하므로 직렬이어야 한다. 병렬이면 그건 map 이다."""
+    fm = FakeFM(delay=0.05)
+    packed, calls = run([Ev(text=BULK)], fm, deadline=Deadline.start(60.0), strategy="refine")
+    assert calls >= 2, f"refine 이 안 돌았다 (calls={calls})"
+    assert fm.max_concurrent == 1, f"동시 {fm.max_concurrent} — 직렬이어야 한다"
+
+
+def test_refine_accumulates_into_one_note() -> None:
+    fm = FakeFM(reply="성인 1회 최대 1,000mg. 1일 4,000mg.")
+    packed, calls = run([Ev(text=BULK)], fm, deadline=Deadline.start(60.0), strategy="refine")
+    assert calls > 0
+    assert "1,000mg" in packed[0][1], packed[0][1][:200]
+
+
+def test_refine_reports_unread_chunks_when_time_runs_out() -> None:
+    """읽다 만 것을 조용히 넘기면 모델은 문서를 다 읽은 요약이라고 믿는다."""
+
+    class Slow(FakeFM):
+        def __init__(self, dl):
+            super().__init__(delay=0.01)
+            self.dl = dl
+
+        async def __call__(self, *a, **kw):
+            # 한 청크 읽을 때마다 시간이 크게 흐른 것처럼 만든다.
+            self.dl.started -= 20.0
+            return await super().__call__(*a, **kw)
+
+    dl = Deadline.start(60.0)
+    fm = Slow(dl)
+    packed, calls = run([Ev(text=BULK)], fm, deadline=dl, strategy="refine")
+    assert calls >= 1
+    assert "not read" in packed[0][1], packed[0][1][-200:]
+
+
+def test_refine_failure_keeps_what_it_had() -> None:
+    fm = FakeFM(raises=RuntimeError("상류가 죽었다"))
+    packed, calls = run([Ev(text=BULK)], fm, deadline=Deadline.start(60.0), strategy="refine")
+    assert packed and len(packed[0][1]) > 100, "근거가 사라졌다"
 
 
 # ── 청크 분할 ─────────────────────────────────────────────────

@@ -7,23 +7,28 @@
   관련 있어 보이면 앞에서부터 예산까지 담다 마는 것과 다를 게 없어진다.
   그때는 압축을 하려면 읽고 줄이는 수밖에 없고, 그건 모델이 해야 한다.
 
-왜 "앞에서부터 요약→요약→요약"(refine chain)이 아닌가
-  순차 refine 은 청크 N개면 LLM 호출 N번이 **직렬**로 붙는다. 실측으로 계산하면:
+두 가지 전략을 둔다 — map(병렬) 과 refine(순차)
+  refine 은 앞에서부터 하나씩 읽으며 누적 요약을 갱신한다. 청크 N개면 LLM 호출
+  N번이 **직렬**로 붙는다. 실측으로 계산하면:
       가장 큰 MCP 결과 29.4KB → 6,000자 청크 5개
       L2 호출 1회(thinking off) 중앙 5.3s · 최대 17.1s
       순차 5회 ≈ 27s ~ 85s
-  검색 단계에 남는 시간은 40s − 26s(답변·검증 몫) = 14s 다. 요약만으로 예산을
-  2~6배 넘긴다. 이 저장소에는 그 실패의 기록이 이미 있다 — 예산 75초로 돌린
-  회차가 0.00 을 받았고, 원인은 답이 나빠서가 아니라 도달하지 못해서였다.
 
-  그래서 **map 만 병렬로 한 라운드** 돌린다.
-      · 청크들을 동시에 요약한다 → 벽시계는 호출 1회분이다
-      · reduce 호출은 두지 않는다. 요약본들은 이미 작아서 이어붙이면 그만이다
-      · 실패·시간초과한 청크는 추출식 결과로 대신한다 (부분 실패가 전체를 죽이지 않는다)
+  이 시간이 감당되는지는 **누구의 시계로 보느냐**에 달렸다.
+      우리 자체 예산 REQUEST_BUDGET_S = 40s  → 안 된다
+      평가자 client timeout                  → conquer_val/test 180s, 기본 360s
+  즉 평가자 기준으로는 여유가 있다. 우리 40초는 우리가 정한 값이다(예산 75초
+  회차가 0.00 을 받은 뒤 줄인 값인데, 그 0.00 의 원인이 지연이라는 것은 팀의
+  추정이지 분리된 관측이 아니다). 그래서 refine 을 막지 않고 **고를 수 있게** 둔다.
 
-  refine 이 더 매끄러운 요약을 만드는 것은 맞다. 앞 요약을 보면서 뒤를 쓰니까.
-  하지만 여기서 필요한 것은 매끄러운 산문이 아니라 **사실 목록**이고, 그건 청크마다
-  독립으로 뽑아도 손해가 거의 없다.
+  map: 청크를 동시에 요약한다 → 벽시계는 호출 1회분. reduce 호출은 없다.
+       요약본들이 이미 작아서 이어붙이면 그만이다.
+  refine: 앞 요약을 보면서 다음 청크를 읽는다. 문서 전체를 관통하는 맥락
+       (앞에서 정의한 용어가 뒤에서 쓰이는 표·기준표)이 있을 때 map 보다 낫다.
+       대신 청크 수만큼 지연이 쌓이고, 앞부분이 반복 요약돼 정보가 마모된다.
+
+  둘 다 시간이 떨어지면 **읽다 만 지점에서 멈추고, 몇 청크를 못 읽었는지 밝힌다.**
+  조용히 멈추면 모델은 문서를 다 읽은 요약이라고 믿는다.
 
 기본은 꺼짐이다
   요청당 상류 호출 수가 곧 지연이고, 이 저장소에서 지연은 점수와 직결됐다.
@@ -43,6 +48,11 @@ log = logging.getLogger("digest")
 
 # off | auto
 DIGEST_MODE = os.environ.get("DIGEST_MODE", "off").strip().lower()
+
+# map | refine — 위 docstring 의 트레이드오프 참고.
+# 기본은 map 이다. 벽시계가 호출 하나분이라 우리 40초 예산 안에서도 돌기 때문이고,
+# refine 이 더 낫다는 근거는 아직 이 프로젝트에서 측정된 적이 없다.
+DIGEST_STRATEGY = os.environ.get("DIGEST_STRATEGY", "map").strip().lower()
 
 # 원문 총량이 이보다 작으면 요약할 이유가 없다. 추출로 충분하다.
 #
@@ -72,6 +82,28 @@ QUESTION:
 {query}
 
 SOURCE:
+{chunk}"""
+
+
+REFINE_PROMPT = """You are building running notes to answer the QUESTION.
+
+You already have NOTES SO FAR. Read the NEW SOURCE and return the updated notes.
+
+Rules:
+- Keep every fact already in the notes unless the new source corrects it.
+- Add only what is new and could help answer the question.
+- Copy numbers, doses, ages, thresholds, code numbers, article numbers, dates and
+  drug names EXACTLY as they appear. Never round, never paraphrase a number.
+- Short factual lines, not prose. No preamble.
+- Return the complete updated notes, not a diff.
+
+QUESTION:
+{query}
+
+NOTES SO FAR:
+{notes}
+
+NEW SOURCE:
 {chunk}"""
 
 
@@ -160,7 +192,10 @@ async def digest(
         )
         return (data["choices"][0]["message"].get("content") or "").strip()
 
-    log.info("다이제스트 %d청크 병렬 요약 (원문 %d자, 추출 %d자)",
+    if DIGEST_STRATEGY == "refine":
+        return await _refine(jobs, items, extracted, query, call_fm, deadline, timeout, budget)
+
+    log.info("다이제스트 map %d청크 병렬 요약 (원문 %d자, 추출 %d자)",
              len(jobs), raw_chars, extracted_chars)
     results = await asyncio.gather(*(one(ch) for _, ch in jobs), return_exceptions=True)
 
@@ -203,3 +238,64 @@ async def digest(
     log.info("다이제스트 완료 — 호출 %d회 · %d자", used_calls,
              sum(len(t) for _, t in digested))
     return digested, used_calls
+
+
+async def _refine(jobs, items, extracted, query, call_fm, deadline, timeout, budget):
+    """앞에서부터 하나씩 읽으며 누적 요약을 갱신한다. (담긴 목록, 쓴 호출 수)
+
+    map 과 달리 직렬이라 청크 수만큼 지연이 쌓인다. 그 대신 앞에서 정의된 것을
+    뒤에서 쓰는 문서(용어 정의 → 기준표 같은)에서 맥락이 이어진다.
+
+    시간이 떨어지면 읽다 만 지점에서 멈추고 **몇 청크를 못 읽었는지 남긴다.**
+    조용히 멈추면 모델은 문서를 다 읽은 요약이라고 믿는다.
+    """
+    notes = ""
+    used_calls = 0
+    read = 0
+    for it, chunk in jobs:
+        if deadline is not None and deadline.remaining() < DIGEST_MIN_S:
+            log.info("refine 중단 — 남은 %.1fs (%d/%d 청크만 읽었다)",
+                     deadline.remaining(), read, len(jobs))
+            break
+        try:
+            data = await call_fm(
+                [{"role": "user", "content": REFINE_PROMPT.format(
+                    query=query[:600], notes=notes or "(none yet)", chunk=chunk)}],
+                DIGEST_OUT_TOKENS,
+                {"chat_template_kwargs": {"enable_thinking": False}},
+                timeout=timeout,
+            )
+            used_calls += 1
+            out = (data["choices"][0]["message"].get("content") or "").strip()
+        except Exception as e:  # noqa: BLE001 — 한 청크가 죽어도 앞의 노트는 살린다
+            log.warning("refine 청크 실패: %s — 지금까지의 노트를 유지한다", type(e).__name__)
+            break
+        if out and out.strip().upper() != "NONE":
+            notes = out
+        read += 1
+
+    if not notes:
+        log.info("refine 이 아무것도 못 건졌다 — 추출 결과를 쓴다")
+        return extracted, used_calls
+
+    unread = len(jobs) - read
+    if unread > 0:
+        notes += f"\n[... {unread} more chunks of the source were not read (time budget) ...]"
+
+    # 누적 노트는 원본 항목 중 가장 큰 것에 붙인다 — 그 항목을 대표로 인용하게 된다.
+    anchor = max(items, key=lambda x: len(getattr(x, "text", "") or ""))
+    packed = [(anchor, notes)]
+    for it in items:
+        if it is anchor:
+            continue
+        text = next((t for o, t in extracted if o is it), "")
+        if text:
+            packed.append((it, text))
+
+    total = sum(len(t) for _, t in packed)
+    if total > budget:
+        share = max(200, budget // max(1, len(packed)))
+        packed = [(it, prune_text(t, query, share)[0]) for it, t in packed]
+    log.info("refine 완료 — 호출 %d회 · %d/%d 청크 · %d자",
+             used_calls, read, len(jobs), sum(len(t) for _, t in packed))
+    return packed, used_calls
