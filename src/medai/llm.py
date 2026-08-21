@@ -82,6 +82,74 @@ def _extract_json(text: str) -> str:
     return text[start:]
 
 
+# ─────────────────────────────────────────────────────────────
+# 자격증명 해석 — 평가 환경이 어떤 이름으로 주는지 우리는 모른다
+#
+# ★ 실측으로 잡은 사고: os.getenv("X", "기본값") 은 X 가 **빈 문자열**이면
+#   기본값을 쓰지 않는다. 평가 컨테이너가 LUNIT_FM_API_KEY= (빈 값) 으로
+#   주입하면 AsyncOpenAI(api_key="") 가 되어 즉시 OpenAIError 를 던지고
+#   프로세스가 종료된다 → docker start --attach 가 exit 1 → 제출물 0점.
+#
+# 그래서 (1) 빈 문자열을 없는 것으로 취급하고
+#        (2) 알려진 이름들을 순서대로 훑는다.
+# 이름 하나를 잘못 짚어 0점이 되는 것보다 몇 개 더 보는 편이 싸다.
+# ─────────────────────────────────────────────────────────────
+_KEY_ENVS = ("LUNIT_FM_API_KEY", "MEDAI_API_KEY", "OPENAI_API_KEY", "LUNIT_API_KEY")
+_URL_ENVS = ("MEDAI_BASE_URL", "LUNIT_FM_API_URL", "OPENAI_BASE_URL")
+
+
+def _env(*names: str) -> str:
+    for n in names:
+        v = (os.getenv(n) or "").strip()
+        if v:
+            return v
+    return ""
+
+
+def _key_from_file() -> str:
+    """파일에서 키를 읽는다 — 환경변수 주입이 없는 평가 환경 대비.
+
+    ★ Dockerfile 에 ENV 로 박지 않는 이유
+      ENV 는 이미지 레이어에 남아 `docker history` 로 누구나 꺼낼 수 있다.
+      파일이면 (1) 레이어에 안 박히고 (2) 교체·삭제가 쉽고
+      (3) .gitignore 로 기본 차단된다 — 필요할 때만 의도적으로 넣는다.
+
+    탐색 순서:
+      1. LUNIT_FM_API_KEY_FILE 이 가리키는 경로
+      2. 프로젝트 루트의 secrets/api_key
+      3. /run/secrets/lunit_api_key   (docker secret 관례)
+    """
+    from .config import ROOT
+    candidates = []
+    p = (os.getenv("LUNIT_FM_API_KEY_FILE") or "").strip()
+    if p:
+        candidates.append(Path(p))
+    candidates += [ROOT / "secrets" / "api_key", Path("/run/secrets/lunit_api_key")]
+    for f in candidates:
+        try:
+            if f.is_file():
+                v = f.read_text(encoding="utf-8").strip()
+                if v:
+                    return v
+        except Exception:
+            continue
+    return ""
+
+
+def _resolve_api_key(lc: dict) -> str:
+    # 설정이 지정한 이름을 먼저, 그다음 알려진 이름들, 마지막으로 파일
+    key = _env(lc.get("api_key_env", "MEDAI_API_KEY"), *_KEY_ENVS) or _key_from_file()
+    # 키가 없어도 클라이언트는 만든다 — 호출이 실패할지언정 서버는 떠야 한다
+    return key or "sk-noauth"
+
+
+def _resolve_base_url(lc: dict) -> str:
+    url = _env(*_URL_ENVS) or (lc.get("base_url") or "").strip()
+    if url and not url.rstrip("/").endswith("/v1"):
+        url = url.rstrip("/") + "/v1"     # LUNIT_FM_API_URL 은 /v1 없이 온다
+    return url
+
+
 class LLM:
     def __init__(self, cfg: Config, run_id: str | None = None):
         self.cfg = cfg
@@ -89,24 +157,37 @@ class LLM:
         lc = cfg["llm"]
         self.run_id = run_id or uuid.uuid4().hex[:8]
         self._log_path = Path(LOGS) / f"llm_{self.run_id}.jsonl"
-        self._log_path.parent.mkdir(parents=True, exist_ok=True)
+        # ⚠️ 평가 컨테이너의 파일시스템이 읽기전용이거나 비-root 로 돌면
+        #    mkdir 하나가 예외를 내고 서버가 통째로 못 뜬다.
+        #    로그는 편의 기능이지 제출물의 기능이 아니다 — 실패해도 계속 간다.
+        self._logging = True
+        try:
+            self._log_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            self._logging = False
         self._lock = asyncio.Lock()
 
-        self.enabled = bool(lc.get("base_url")) and AsyncOpenAI is not None
+        base_url = _resolve_base_url(lc)
+        self.enabled = bool(base_url) and AsyncOpenAI is not None
         self.client = None
         if self.enabled:
             self.client = AsyncOpenAI(
-                base_url=lc["base_url"],
-                api_key=os.getenv(lc.get("api_key_env", "MEDAI_API_KEY"), "sk-noauth"),
+                base_url=base_url,
+                api_key=_resolve_api_key(lc),
                 timeout=lc.get("timeout", 30.0),        # ⚠️ 기본 600초 방지
                 max_retries=lc.get("max_retries", 1),
             )
 
     # ── 로깅 ────────────────────────────────────────────────
     async def _log(self, rec: dict[str, Any]) -> None:
-        async with self._lock:
-            with open(self._log_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        if not self._logging:
+            return
+        try:
+            async with self._lock:
+                with open(self._log_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception:
+            self._logging = False    # 한 번 실패하면 더 시도하지 않는다
 
     # ── 기본 호출 ───────────────────────────────────────────
     async def chat(

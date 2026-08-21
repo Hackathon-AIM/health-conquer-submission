@@ -202,17 +202,29 @@ def render_evidence(uid: str, raw: str, limit: int) -> str:
     if target is None:                       # 합성 uid 등 — 최상위를 쓴다
         target = obj if isinstance(obj, dict) else {"text": raw}
 
-    head = []
+    title = ""
     for k in ("title", "doc_title"):
         if target.get(k):
-            head.append(str(target[k]))
+            title = str(target[k])
             break
     url = target.get("url") or target.get("source_url")
     body = _extract_text(target)
-    prefix = (head[0] + "\n") if head else ""
+
+    # ★ 가이드의 예시 블록 형식을 그대로 따른다.
+    #     source_type: guideline
+    #     url: ...
+    #     title: ...
+    #     content: ...
+    #   L2 는 이 형식으로 학습됐을 가능성이 높다. 임의 형식으로 주면
+    #   모델이 인용 번호를 안 붙이거나 근거를 무시할 수 있다
+    #   (실측: 근거 4블록을 줬는데 답변에 [1] 이 안 붙었다).
+    lines = []
     if url:
-        prefix = f"{prefix}url: {url}\n"
-    return (prefix + body)[:limit]
+        lines.append(f"url: {url}")
+    if title:
+        lines.append(f"title: {title}")
+    lines.append("content: " + body)
+    return "\n".join(lines)[:limit]
 
 
 _EVICTED = "[이전 검색 결과 — 컨텍스트 예산 때문에 생략됨. 이미 본 내용입니다]"
@@ -236,17 +248,31 @@ def _evict_old_tool_msgs(msgs: list[dict], budget: int) -> int:
     return max(total, 0)
 
 
-def _guess_source_type(tool: str) -> str:
+def _guess_source_type(tool: str, args: Optional[dict] = None,
+                       raw: str = "") -> str:
+    """가이드 예시의 `source_type: guideline` 처럼 한 단어로 낸다.
+
+    우선순위: 도구 결과가 스스로 밝힌 값 → 호출 인자의 corpus_tag → 도구 이름 추정.
+    """
+    if raw:
+        m = re.search(r'"source_type"\s*:\s*"([^"]+)"', raw)
+        if m:
+            return m.group(1)
     if tool.startswith("index_"):
-        return "guideline/hira"
+        # hira 와 guideline 두 코퍼스를 같은 도구가 쓴다 — 인자로 구분한다
+        return (args or {}).get("corpus_tag") or "guideline"
     if "law" in tool:
         return "law"
-    if "mfds" in tool or tool.startswith("adr_"):
+    if "mfds" in tool:
+        return "drug_approval"
+    if tool.startswith("adr_"):
         return "drug_label"
     if "hira" in tool:
         return "hira"
     if "kcd" in tool:
         return "kcd"
+    if "vector" in tool:
+        return (args or {}).get("collection_name") or "literature"
     if tool.startswith("rag_"):
         return "database"
     return tool
@@ -299,7 +325,15 @@ class L2Harness:
         if not allow:                       # 응급 등 — 검색 자체를 하지 않는다
             return {"status": "no_evidence", "note": "retrieval skipped", "blocks": []}
 
-        await self.mcp.connect()
+        # MCP 서버에 못 붙으면 검색을 포기하되 예외는 올리지 않는다.
+        try:
+            await self.mcp.connect()
+        except Exception as e:
+            self.trace["retrieval"] = {"query": query[:120], "tool_calls": 0,
+                                       "status": "no_evidence", "cited": 0,
+                                       "error": f"{type(e).__name__}: {e}"}
+            return {"status": "no_evidence",
+                    "note": f"MCP unreachable ({type(e).__name__})", "blocks": []}
         tools = self.mcp.openai_tools(allow) + [FINALIZE_TOOL]
 
         msgs: list[dict] = [
@@ -311,6 +345,7 @@ class L2Harness:
         calls = 0
         used_chars = 0                      # 대화에 누적된 도구 결과 총량
         nudged = False                      # "본문을 열어라" 되돌림은 한 번만
+        called_tools: list = []             # 실제로 부른 MCP 도구 (E2E 검증용)
 
         while calls < self.max_tool_calls:
             msg = await self._chat_tools(msgs, tools)
@@ -346,6 +381,7 @@ class L2Harness:
                     continue
 
                 calls += 1
+                called_tools.append(name)
                 result = await self.mcp.call(name, args)
                 uids = find_cite_uids(result)
                 # ★ 실측(probe 2차): 조회 도구는 cite_uid 를 준다(MFDS·KCD·DailyMed·
@@ -362,7 +398,7 @@ class L2Harness:
                 for uid in uids:
                     # 원문 전체를 보관한다 — 자르는 것은 블록을 만들 때 한 번만.
                     # 여기서 미리 자르면 뒤쪽 페이지 본문이 영영 사라진다.
-                    cite_store.setdefault(uid, {"tool": name, "text": result})
+                    cite_store.setdefault(uid, {"tool": name, "args": args, "text": result})
                 budget_note = ""
                 if calls >= self.max_tool_calls:
                     budget_note = ("\n\n[예산 소진] 더 이상 도구를 호출할 수 없습니다. "
@@ -425,17 +461,71 @@ class L2Harness:
                 continue        # 모델이 지어낸 uid 는 버린다
             body = render_evidence(uid, src["text"], self.evidence_chars)
             blocks.append(
-                f"[{i}]\nsource_type: {_guess_source_type(src['tool'])}\n{body}"
+                f"[{i}]\nsource_type: "
+                + _guess_source_type(src["tool"], src.get("args"), src["text"])
+                + f"\n{body}"
             )
 
         self.trace["retrieval"] = {
             "query": query[:120], "tool_calls": calls,
             "status": selection.get("status"),
             "cited": len(blocks), "collected_uids": len(cite_store),
+            # ★ 어떤 MCP 도구가 실제로 불렸고 어떤 코퍼스가 인용됐는지.
+            #   TOOLSETS 매핑이 의도대로 작동하는지 E2E 로 확인하는 근거다.
+            "tools": called_tools,
+            "sources": sorted({b.split("source_type: ")[1].split("\n")[0]
+                               for b in blocks if "source_type: " in b}),
             "ms": int((time.perf_counter() - t0) * 1000),
         }
         return {"status": selection.get("status", "partial"),
                 "note": selection.get("note", ""), "blocks": blocks}
+
+    # ── 근거 강제 판정 ──────────────────────────────────────
+    #
+    # ★ 이 해커톤에서 MCP 는 도구가 아니라 **RAG 그 자체**다.
+    #   가이드라인 120편·HIRA 249편·법령·허가사항·PubMed·FAERS 가 전부 여기 있고,
+    #   다른 접근 경로가 없다. 그런데 L2 는 "알 것 같으면" 그냥 답해버린다.
+    #   E2E 실측: 검색 0회 · 인용 0건인데 답변엔 [1] 이 붙어 있었다(환각).
+    #   → 출처가 필요한 질문은 하네스가 검색을 먼저 돌리고 근거를 쥐여준다.
+    _NEEDS_EVIDENCE = re.compile(
+        r"(가이드라인|지침|권고|기준치|목표(치|가|는)|"                    # 진료지침
+        r"급여|본인부담|비급여|고시|심의|수가|약가|상한|청구|"              # 보험·제도
+        r"법(률|령|상|에|은|이)|조문|제\s*\d+\s*조|시행령|시행규칙|"        # 법령
+        r"허가|효능|효과|용법|용량|복용량|금기|병용|상호작용|부작용|"        # 약물
+        r"같이\s*(먹|복용|드)|함께\s*(먹|복용|드)|동시에\s*(먹|복용)|"        # 병용 구어체
+        r"먹어도\s*(되|괜찮)|복용해도\s*(되|괜찮)|"
+        r"KCD|질병\s*코드|상병|분류코드|"                                  # 코드
+        r"최신|연구|논문|근거|공식|정설|통계|유병률)")                      # 문헌
+
+    _EVIDENCE_INTENTS = {Intent.POLICY, Intent.DRUG_SAFETY, Intent.INFO_REQUEST}
+
+    def _needs_evidence(self, query: str, intent: Optional[Intent]) -> bool:
+        if intent in self._EVIDENCE_INTENTS:
+            return True
+        return bool(self._NEEDS_EVIDENCE.search(query))
+
+    async def _safe_retrieval(self, query: str, intent: Optional[Intent]) -> dict:
+        """예외를 올리지 않는 검색 — 실패해도 답변은 나와야 한다."""
+        try:
+            return await self.retrieval_stage(query, intent)
+        except Exception as e:
+            self.trace["retrieval_error"] = f"{type(e).__name__}: {e}"
+            return {"status": "no_evidence",
+                    "note": f"retrieval unavailable ({type(e).__name__})",
+                    "blocks": []}
+
+    _CITE_MARK = re.compile(r"\s*\[\d+\]")
+
+    def _finish(self, text: str, evidence_given: bool) -> str:
+        """근거를 안 줬는데 인용 번호가 붙어 있으면 떼어낸다.
+
+        지어낸 인용은 없는 것보다 나쁘다 — 정확성이 채점의 43% 다.
+        """
+        out = strip_think(text or "")
+        if not evidence_given and self._CITE_MARK.search(out):
+            self.trace["stripped_fake_citations"] = len(self._CITE_MARK.findall(out))
+            out = self._CITE_MARK.sub("", out)
+        return out
 
     # ── 생성 단계 ───────────────────────────────────────────
     async def generate(self, user_query: str, *,
@@ -460,11 +550,47 @@ class L2Harness:
         msgs: list[dict] = [{"role": "system", "content": sys},
                             {"role": "user", "content": user_query}]
         retrievals = 0
+        evidence_given = False       # 근거를 실제로 건넸는가 (인용 허용 여부)
+
+        # ★ 출처가 필요한 질문인데 모델이 도구를 안 부르는 문제 (E2E 실측).
+        #   "가이드라인상 CKD 혈압 목표"를 물었는데 검색 0회로 답하면서 [1] 을
+        #   지어냈다. 프롬프트만으로는 못 막는다 — 첫 호출을 하네스가 강제한다.
+        #   가이드도 "retrieval 과 generation 을 잇는 방식은 자유"라고 했다.
+        forced_ok = False
+        if intent is not Intent.EMERGENCY and self._needs_evidence(user_query, intent):
+            r0 = await self._safe_retrieval(user_query, intent)
+            self.trace["forced_retrieval"] = True
+            if r0["blocks"]:
+                evidence_given = forced_ok = True
+                msgs[0]["content"] += (
+                    "\n\n[미리 확보한 근거 — 이 번호로만 인용하세요]\n"
+                    + f"status: {r0['status']}\n"
+                    + (f"note: {r0['note']}\n" if r0["note"] else "")
+                    + "\n\n".join(r0["blocks"])
+                )
+            else:
+                msgs[0]["content"] += (
+                    f"\n\n[근거 검색 결과] status: {r0['status']} — 인용 가능한 근거를 "
+                    "확보하지 못했습니다. 인용 번호를 쓰지 말고, 일반적인 의학 지식에 "
+                    "근거한 답임을 밝히세요."
+                )
+
+        # ★ 강제 검색으로 이미 근거를 쥐여줬으면 도구를 다시 열어주지 않는다.
+        #   E2E 실측: 열어두면 모델이 한 번 더 검색해서 같은 턴에 검색이 2회 돈다.
+        #     ⑥ 법령 질문 89.2초 (강제 1회 + 모델 1회, 두 번째는 소득 0)
+        #     ③ 병용금기 88.8초 (adr_retrieve_drug_info 를 3번 반복 호출)
+        #   근거는 이미 시스템 프롬프트에 있으므로 바로 답을 쓰게 한다 — 절반이 준다.
+        if forced_ok:
+            msg = await self._chat_tools(msgs, [RETRIEVE_TOOL], tool_choice="none")
+            out = self._finish(msg.content or "", evidence_given)
+            if out:
+                return out
+            # 빈 응답이면 아래 일반 루프로 폴백
 
         for _ in range(self.max_retrievals + 1):
             msg = await self._chat_tools(msgs, [RETRIEVE_TOOL])
             if not msg.tool_calls:
-                return strip_think(msg.content or "")
+                return self._finish(msg.content or "", evidence_given)
 
             msgs.append({
                 "role": "assistant",
@@ -478,7 +604,14 @@ class L2Harness:
                     q = user_query
                 if retrievals < self.max_retrievals:
                     retrievals += 1
-                    r = await self.retrieval_stage(q, intent)
+                    # ★ 검색이 실패해도 답변은 나와야 한다.
+                    #   MCP 가 막혀 있거나(격리 환경) 도구가 죽어도 여기서 예외가
+                    #   위로 올라가면 serve.py 가 사과 문구로 대체해 버린다.
+                    #   그러면 그 문항은 사실상 0점이다.
+                    #   근거 없이라도 L2 가 자기 지식으로 답하게 두는 편이 훨씬 낫다.
+                    r = await self._safe_retrieval(q, intent)
+                    if r["blocks"]:
+                        evidence_given = True
                     body = f"status: {r['status']}\n"
                     if r["note"]:
                         body += f"note: {r['note']}\n"
@@ -494,9 +627,9 @@ class L2Harness:
         msgs.append({"role": "user",
                      "content": "지금까지의 정보로 최종 답변을 작성하세요. 도구를 더 부르지 마세요."})
         msg = await self._chat_tools(msgs, [RETRIEVE_TOOL], tool_choice="none")
-        out = strip_think(msg.content or "")
+        out = self._finish(msg.content or "", evidence_given)
         if not out:   # 그래도 비면 마지막 assistant 발화라도 살린다
             for m in reversed(msgs):
                 if m.get("role") == "assistant" and (m.get("content") or "").strip():
-                    return strip_think(m["content"])
+                    return self._finish(m["content"], evidence_given)
         return out

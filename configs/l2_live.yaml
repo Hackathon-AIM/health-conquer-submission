@@ -39,8 +39,11 @@ layers:
   critic: false            # L2 위에서의 비평 패스 효과는 미검증 — ab 로 재고 켠다
 
 l2:
-  max_tool_calls: 8
-  max_retrievals_per_turn: 2
+  # 실측(E2E): 8회를 주면 모델이 같은 도구를 3번씩 반복 호출한다
+  # (adr_retrieve_drug_info ×3). 6회면 탐색→본문조회 체인이 충분히 돈다.
+  max_tool_calls: 6
+  # 강제 검색이 이미 근거를 확보하므로 모델의 추가 검색은 1회로 족하다.
+  max_retrievals_per_turn: 1
   # 실측(data/probe/page_stats.json): 가이드라인 1페이지 = 3,929자.
   # 1800 이면 페이지 한 장도 절반이 잘렸다 (권고 문장은 문단 뒤쪽에 있다).
   evidence_chars_per_item: 4000

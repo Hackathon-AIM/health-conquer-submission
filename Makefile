@@ -126,6 +126,11 @@ l2-smoke:
 chat:
 	$(PY) scripts/chat.py
 
+# 평가자와 동일한 HTTP 경로로 E2E 검증 (컨테이너를 먼저 띄울 것)
+#   docker run --rm -p 8000:8000 medai:local
+e2e:
+	$(PY) scripts/e2e.py
+
 # ── 제출 (docs/submission.md) ───────────────────────────────
 submit-check:
 	$(PY) scripts/submit_check.py

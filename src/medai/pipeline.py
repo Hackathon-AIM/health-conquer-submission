@@ -23,6 +23,7 @@ LangGraph가 현장에서 말썽을 부리면 그냥 이걸 쓰면 된다.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 
 from . import classify as classify_mod
@@ -37,6 +38,10 @@ from .contracts import Context, Intent, QueryPlan, SafetyHit, SessionState, Turn
 from .critic import critique_loop
 from .gates import dur as dur_mod
 from .llm import LLM
+
+# 답변 앞머리에 이미 응급 안내가 있는지 — 중복 삽입 방지용
+_EMERGENCY_LEAD = re.compile(
+    r"(119|응급실|응급\s*의료|즉시\s*(내원|병원|진료)|바로\s*(병원|응급))")
 
 
 class Pipeline:
@@ -186,11 +191,15 @@ class Pipeline:
             answer = await gen.draft(text, plan, ctx, session, input_hits, self.llm, self.cfg)
 
         # 응급 안내를 문자열 조립 단계에서 첫 문단으로 확정한다.
-        # 모델이 뭘 쓰든 그 앞에 붙는다. 뒤에 묻으면 -9 이므로 재량에 맡기지 않는다.
-        if red_flag is not None:
-            prefix = gen.emergency_prefix(red_flag.category)
-            if prefix.split(".")[0][:12] not in answer[:250]:
-                answer = prefix + "\n\n" + answer
+        # 모델이 뭘 쓰든 그 앞에 붙는다. 뒤에 묻으면 감점이므로 재량에 맡기지 않는다.
+        #
+        # ★ 다만 모델이 **이미 첫 문단에 응급 안내를 썼으면 붙이지 않는다.**
+        #   실측(E2E ②): "지금 바로 119에 전화하세요"(우리 prefix) 바로 뒤에
+        #   "🚨 지금 즉시 119에 연락하거나…"(모델)가 이어져 같은 말이 두 번 나왔다.
+        #   임상의가 읽는 프론티어 평가에서 이런 중복은 그대로 감점이다.
+        #   문자열 일치가 아니라 '응급 신호가 앞머리에 있는가'로 판단한다.
+        if red_flag is not None and not _EMERGENCY_LEAD.search(answer[:200]):
+            answer = gen.emergency_prefix(red_flag.category) + "\n\n" + answer
         return answer
 
     async def node_l4b(self, text, plan, session, answer, input_hits):
@@ -290,17 +299,33 @@ class Pipeline:
         mark("l4", t)
 
         # L4b — 모델이 '추천한' 약을 검증
+        #
+        # ★ 여기부터는 '이미 만든 답변을 다듬는' 단계다. 다듬다 실패했다고
+        #   답변 자체를 버리면 그 문항은 0점이 된다. 초안을 지키는 쪽으로 감싼다.
+        #   (안전 게이트가 못 돌면 경고가 빠지는 손해는 있지만, 답이 통째로
+        #    사라지는 것보다 항상 낫다.)
         t = time.perf_counter()
-        answer, all_hits, mentioned = await self.node_l4b(
-            text, plan, session, answer, input_hits
-        )
+        all_hits, mentioned = [], []
+        try:
+            answer, all_hits, mentioned = await self.node_l4b(
+                text, plan, session, answer, input_hits
+            )
+        except Exception as e:
+            lat["l4b_error"] = 1
+            trace_err = f"l4b: {type(e).__name__}: {e}"
+        else:
+            trace_err = ""
         mark("l4b", t)
 
         # L4c
         t = time.perf_counter()
-        answer, crit = await self.node_l4c(
-            text, answer, plan, ctx, session, all_hits, deadline
-        )
+        crit = None
+        try:
+            answer, crit = await self.node_l4c(
+                text, answer, plan, ctx, session, all_hits, deadline
+            )
+        except Exception as e:
+            trace_err = (trace_err + f" | l4c: {type(e).__name__}: {e}").strip(" |")
         mark("l4c", t)
 
         lat["total"] = int((time.perf_counter() - t_start) * 1000)
@@ -323,6 +348,7 @@ class Pipeline:
                 "drugs_in": [d.name for d in plan.entities.drugs],
                 "drugs_out": mentioned,
                 "l2": (dict(self.l2.trace) if self.l2 is not None else None),
+                "degraded": trace_err or None,   # 뒷단계가 실패했으면 여기 남는다
                 "violations": [v.item for v in (crit.violations if crit else [])],
             },
         )
