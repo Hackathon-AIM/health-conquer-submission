@@ -12,6 +12,8 @@ import asyncio
 import logging
 import os
 import re
+import time
+import uuid
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -37,6 +39,7 @@ _FALLBACK_KEY = "lunit_dFthkHMh2_gB2aVIo_mi5jznWpHoXbU2a2Od4hlVtf4"
 FM_URL = os.environ.get("LUNIT_FM_API_URL", "https://model.hackathon.lunit.io").rstrip("/")
 FM_KEY = os.environ.get("LUNIT_FM_API_KEY", "").strip() or _FALLBACK_KEY
 FM_MODEL = os.environ.get("LUNIT_FM_MODEL", "Lunit/L2-preview")
+PUBLIC_MODEL = os.environ.get("HARNESS_MODEL_NAME", "medai")
 
 # 서버가 max_tokens 2048 을 넘기면 400 (`output_limit_exceeded`) 을 던진다. 이건 상한이다.
 SERVER_MAX_TOKENS = 2048
@@ -163,7 +166,12 @@ async def health() -> dict[str, Any]:
 
 @app.get("/v1/models")
 async def list_models() -> dict[str, Any]:
-    return {"object": "list", "data": [{"id": FM_MODEL, "object": "model", "owned_by": "lunit"}]}
+    models = [
+        {"id": PUBLIC_MODEL, "object": "model", "created": 0, "owned_by": "team"},
+    ]
+    if FM_MODEL != PUBLIC_MODEL:
+        models.append({"id": FM_MODEL, "object": "model", "created": 0, "owned_by": "lunit"})
+    return {"object": "list", "data": models}
 
 
 # 일시적인 것들. 실측으로 502(nginx)를 봤다 — 재시도 없이 두면 그 문항이 통째로 0점이다.
@@ -449,9 +457,13 @@ async def chat_completions(body: dict) -> dict[str, Any]:
         content = _last_resort_answer(messages)
 
     log.info("응답 %d자 / %.1fs", len(content), dl.elapsed)
+    prompt_chars = sum(len(_content_text(message.get("content"))) for message in messages)
+    completion_chars = len(content)
     return {
+        "id": "chatcmpl-" + uuid.uuid4().hex[:24],
         "object": "chat.completion",
-        "model": FM_MODEL,
+        "created": int(time.time()),
+        "model": body.get("model") or PUBLIC_MODEL,
         "choices": [
             {
                 "index": 0,
@@ -459,4 +471,9 @@ async def chat_completions(body: dict) -> dict[str, Any]:
                 "finish_reason": "stop",
             }
         ],
+        "usage": {
+            "prompt_tokens": max(1, int(prompt_chars * 0.7)),
+            "completion_tokens": max(1, int(completion_chars * 0.7)),
+            "total_tokens": max(2, int((prompt_chars + completion_chars) * 0.7)),
+        },
     }

@@ -14,7 +14,6 @@ docs
 **/__pycache__
 **/*.pyc
 .DS_Store
-# ⚠️ 키는 절대 이미지에 들어가지 않는다. 평가 환경이 환경변수로 주입한다.
 .env
 data/probe
 # 규정: HealthBench 과도한 역공학 금지. 이 스크립트는 이미 폐기했고

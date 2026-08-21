@@ -117,6 +117,16 @@ class AppDriverTests(unittest.TestCase):
         content = response["choices"][0]["message"]["content"]
         self.assertTrue(content)
         self.assertIn("119", content)
+        self.assertTrue(response["id"].startswith("chatcmpl-"))
+        self.assertEqual(response["model"], "medai")
+        self.assertGreater(response["usage"]["total_tokens"], 0)
+
+    def test_models_endpoint_lists_public_and_lunit_model(self) -> None:
+        response = asyncio.run(driver_app.list_models())
+        ids = {item["id"] for item in response["data"]}
+
+        self.assertIn("medai", ids)
+        self.assertIn("Lunit/L2-preview", ids)
 
     def test_mcp_gate_ignores_ordinary_symptom_question(self) -> None:
         route = driver_app._mcp_route([
