@@ -4,8 +4,13 @@
 이 서버가 다음 assistant 응답을 돌려준다.
 
 요청 하나의 흐름:
-  라우터가 도메인·응급도·맥락 충분성·페르소나를 정하고,
-  그 판정에 따라 되묻기 / 직답 / 검색-후-답변으로 갈린다.
+  1. 라우터가 도메인·응급도·페르소나를 정하고 도메인에 맞는 MCP 도구만 고른다
+  2. retrieval 이 그 도구로 근거를 모아 cite_uid 를 확정한다
+  3. generation 이 근거를 컨텍스트에 얹어 답을 쓴다
+  4. verify 가 내보내기 전에 답을 한 번 더 검사하고, 필요하면 고친다
+
+단계마다 남은 시간을 보고 스스로 줄인다. 답을 못 내는 것이 가장 나쁘므로
+어느 단계가 실패해도 그때까지 만든 답으로 내려간다.
 """
 
 import asyncio
@@ -21,6 +26,7 @@ from budget import Deadline
 from generation import generate
 from mcp_client import MCPClient
 from router import classify
+from verify import verify
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("driver")
@@ -55,6 +61,10 @@ EMERGENCY_BUDGET = int(os.environ.get("EMERGENCY_BUDGET", "2"))
 # 답을 늦게 주는 것과 안 주는 것이 채점에서 같다면, 짧게 끊고 답을 내는 편이 낫다.
 REQUEST_BUDGET_S = float(os.environ.get("REQUEST_BUDGET_S", "40"))
 ANSWER_RESERVE_S = float(os.environ.get("ANSWER_RESERVE_S", "18"))
+
+# 출력 검증 몫. 검색은 답변 몫과 이 몫을 둘 다 남기고 멈춰야 한다.
+# 남은 시간이 이보다 적으면 리뷰 호출을 건너뛰고 규칙 검사만 돌린다.
+VERIFY_RESERVE_S = float(os.environ.get("VERIFY_RESERVE_S", "8"))
 
 # 우리 스스로를 밀어내지 않도록 상류 호출을 조인다. 요청 하나가 FM 을 최대 9회,
 # MCP 를 6회까지 부르기 때문에 동시 요청이 몰리면 상류가 먼저 무너진다.
@@ -169,17 +179,67 @@ async def call_fm(
     raise last
 
 
-async def generate_reply(messages: list[dict], dl: Deadline) -> str:
-    """최신 사용자 질문에 한정된 답변 행동 지시를 붙여 L2에 전달한다."""
+def _last_user_text(messages: list[dict]) -> str:
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            content = message.get("content")
+            if isinstance(content, str):
+                return content.strip()
+    return ""
+
+
+def _with_answer_instruction(messages: list[dict]) -> list[dict]:
+    """최신 사용자 턴에만 답변 행동 지시를 붙인다. 히스토리는 건드리지 않는다."""
     forwarded = [dict(message) for message in messages]
     if forwarded and forwarded[-1].get("role") == "user":
         content = forwarded[-1].get("content")
         if isinstance(content, str):
             forwarded[-1]["content"] = f"{content}\n\n[{ANSWER_INSTRUCTION}]"
-    data = await call_fm(forwarded, MAX_TOKENS)
-    content = (data["choices"][0]["message"].get("content") or "").strip()
+    return forwarded
+
+
+async def generate_reply(messages: list[dict], dl: Deadline) -> str:
+    """라우팅 → MCP 근거 검색 → 생성 → 출력 검증 순으로 다음 발화를 만든다."""
+    route = await classify(messages, call_fm)
+    log.info(
+        "route: domain=%s urgency=%s persona=%s lang=%s date=%s src=%s tools=%d",
+        route.domain, route.urgency, route.persona, route.lang,
+        route.date_sensitive, route.source, len(route.tools),
+    )
+
+    # 응급이면 검색을 짧게 끊는다. 응급에서 값을 내는 건 근거 인용이 아니라 즉시 의뢰다.
+    budget = EMERGENCY_BUDGET if route.urgency == "emergency" else RETRIEVAL_BUDGET
+
+    # 검색은 답을 쓸 시간과 검증할 시간을 둘 다 남기고 멈춰야 한다.
+    content, retr = await generate(
+        _with_answer_instruction(messages),
+        route,
+        call_fm,
+        MCP,
+        MAX_TOKENS,
+        budget,
+        deadline=dl,
+        reserve=ANSWER_RESERVE_S + VERIFY_RESERVE_S,
+    )
     if not content:
-        log.error("L2 raw 응답의 content가 비었다 — elapsed=%.1fs", dl.elapsed)
+        log.error("generation 이 빈 content 를 냈다 — elapsed=%.1fs", dl.elapsed)
+        return content
+
+    content, issues = await verify(
+        content,
+        _last_user_text(messages),
+        retr.as_prompt() if retr else "",
+        len(retr.items) if retr else 0,
+        call_fm,
+        MAX_TOKENS,
+        lang=route.lang,
+        deadline=dl,
+        reserve=VERIFY_RESERVE_S,
+    )
+    if issues:
+        log.info("검증 지적 %d건: %s", len(issues), "; ".join(issues)[:300])
+    if not content:
+        log.error("검증 후 content 가 비었다 — elapsed=%.1fs", dl.elapsed)
     return content
 
 
