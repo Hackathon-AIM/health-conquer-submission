@@ -38,8 +38,10 @@ FM_KEY = os.environ.get("LUNIT_FM_API_KEY", "").strip() or _FALLBACK_KEY
 FM_MODEL = os.environ.get("LUNIT_FM_MODEL", "Lunit/L2-preview")
 
 # 서버가 max_tokens 2048 을 넘기면 400 (`output_limit_exceeded`) 을 던진다. 이건 상한이다.
-SERVER_MAX_TOKENS = 2048
-MAX_TOKENS = min(int(os.environ.get("FM_MAX_TOKENS", "2048")), SERVER_MAX_TOKENS)
+# 2026-08-21 18:39 KST 실측: upstream 이 3072·6144 요청을 모두 200 으로 받는다.
+# 과거 400 (output_limit_exceeded) 을 근거로 둔 2048 하드캡은 낡았다.
+SERVER_MAX_TOKENS = 6144
+MAX_TOKENS = min(int(os.environ.get("FM_MAX_TOKENS", "6144")), SERVER_MAX_TOKENS)
 TIMEOUT = float(os.environ.get("FM_TIMEOUT", "120"))
 FM_RETRIES = int(os.environ.get("FM_RETRIES", "3"))
 FM_BACKOFF = float(os.environ.get("FM_BACKOFF", "1.5"))
