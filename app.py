@@ -11,11 +11,14 @@
 import asyncio
 import logging
 import os
+import re
+import time
 from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
 from fastapi import FastAPI
+from langdetect import DetectorFactory, LangDetectException, detect
 
 from budget import Deadline
 from generation import generate
@@ -24,6 +27,9 @@ from router import classify
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("driver")
+
+# langdetect는 짧은 문장에서 샘플링을 사용한다. 평가 재현성을 위해 고정한다.
+DetectorFactory.seed = 0
 
 # 평가 환경이 키를 주입해 주는지 확인되지 않았다. 주입되지 않으면 FM 호출이 전부
 # 실패해 답이 통째로 비고, 그 채점은 0점이다 — 실측으로 Done 인데 score 0.00 을 봤다.
@@ -161,12 +167,167 @@ async def call_fm(
     raise last
 
 
+_HANGUL_RE = re.compile(r"[\uac00-\ud7a3]")
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
+_ENGLISH_HINT_RE = re.compile(
+    r"\b(?:i|my|we|our|what|when|where|why|how|can|could|should|would|do|does|did|"
+    r"is|are|was|were|have|has|had|with|without|take|taking|continue|stop|male|"
+    r"female|patient|pain|fever|medicine|medication|doctor|versus|vs)\b",
+    re.IGNORECASE,
+)
+
+
+def _last_user_text(messages: list[dict]) -> str:
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            content = message.get("content")
+            if isinstance(content, str):
+                return content.strip()
+    return ""
+
+
+def _language(text: str) -> str:
+    """`ko`, `en`, 또는 번역이 필요한 다른 ISO 언어 코드를 돌려준다."""
+    if _HANGUL_RE.search(text):
+        return "ko"
+    if not text:
+        return "en"
+    # langdetect는 "45yo male eGFR 38, continue ACEi?" 같은 짧은 임상 영어를
+    # 스페인어로 오판한다. 흔한 영어 문법·임상 토큰이 있으면 먼저 보호한다.
+    if _ENGLISH_HINT_RE.search(text):
+        return "en"
+    try:
+        return detect(text)
+    except LangDetectException:
+        # 짧은 약명·수치만 있는 후속 턴은 앞선 대화가 이미 맥락을 제공한다.
+        return "en"
+
+
+def _clean_content(content: str) -> tuple[str, bool]:
+    """노출된 사고 토큰을 제거하고, 제거 여부도 반환한다."""
+    original = content
+    if "</think>" in content.lower():
+        # 정상적인 `<think>reasoning</think>answer` 형태면 답변 부분만 보존한다.
+        content = re.split(r"</think>", content, flags=re.IGNORECASE)[-1]
+    content = _THINK_BLOCK_RE.sub("", content)
+    content = re.sub(r"</?think>", "", content, flags=re.IGNORECASE).strip()
+    return content, content != original.strip()
+
+
+async def _translate_latest_to_english(messages: list[dict], text: str) -> list[dict]:
+    """비영어 최신 사용자 턴만 영어로 정규화한다. 외부 API를 사용하지 않는다."""
+    prompt = [
+        {
+            "role": "system",
+            "content": (
+                "Translate the user's medical question into natural, precise English. "
+                "Preserve drug names, measurements, symptoms, negations, and uncertainty. "
+                "Return only the translation, with no explanation."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "Translate the medical question between <source> tags into English. "
+                "Output only the English translation.\n\n"
+                f"<source>{text}</source>"
+            ),
+        },
+    ]
+    data = await call_fm(prompt, 700)
+    translated, _ = _clean_content(
+        (data["choices"][0]["message"].get("content") or "").strip()
+    )
+    if not translated or _language(translated) != "en":
+        # 잘못된 현지어 답변을 다음 생성으로 넘기면 언어 붕괴가 연쇄된다.
+        # 원문과 영어 명령을 함께 둔 단일 턴으로 한 번 더 강하게 교정한다.
+        log.warning("번역 결과가 영어가 아니어서 재시도한다")
+        retry_prompt = [{
+            "role": "user",
+            "content": (
+                "Write ONLY an English translation of this text. Do not answer it and "
+                f"do not use its language: <source>{text}</source>"
+            ),
+        }]
+        retry = await call_fm(retry_prompt, 700)
+        translated, _ = _clean_content(
+            (retry["choices"][0]["message"].get("content") or "").strip()
+        )
+    if not translated:
+        log.warning("번역 결과가 비어 원문을 유지한다")
+        translated = text
+
+    normalized = [dict(message) for message in messages]
+    for index in range(len(normalized) - 1, -1, -1):
+        if normalized[index].get("role") == "user":
+            normalized[index]["content"] = translated
+            break
+    normalized.insert(0, {
+        "role": "system",
+        "content": (
+            "Answer the latest medical question in clear English. Use the conversation "
+            "context, but do not answer in the source language."
+        ),
+    })
+    return normalized
+
+
+def _suspicious(content: str, expected: str, elapsed: float, leaked_think: bool) -> bool:
+    if not content or leaked_think or len(content) > 3500:
+        return True
+    # 느리면서 긴 응답은 실측상 반복문·코드 조각으로 붕괴한 경우가 많았다.
+    if elapsed > 30 and len(content) > 2500:
+        return True
+    actual = _language(content)
+    if expected == "ko":
+        return not bool(_HANGUL_RE.search(content))
+    return actual not in {"en"}
+
+
+def _retry_messages(messages: list[dict], expected: str) -> list[dict]:
+    language = "Korean" if expected == "ko" else "English"
+    return [{
+        "role": "system",
+        "content": (
+            f"Answer in clear {language}. Give a direct, medically careful answer under "
+            "700 words. Do not reveal reasoning or use <think> tags. Do not emit code, "
+            "repetitive punctuation, or text in another language."
+        ),
+    }, *messages]
+
+
 async def generate_reply(messages: list[dict], dl: Deadline) -> str:
-    """Evaluator의 대화를 수정하지 않고 L2에 그대로 전달하는 기준선."""
-    data = await call_fm(messages, MAX_TOKENS)
-    content = (data["choices"][0]["message"].get("content") or "").strip()
+    """영어·한국어는 직결하고, 그 외 언어는 영어로 정규화해 답한다."""
+    source_lang = _language(_last_user_text(messages))
+    expected = source_lang if source_lang in {"ko", "en"} else "en"
+    prepared = messages
+    if source_lang not in {"ko", "en"}:
+        log.info("비지원 출력 언어 %s — 영어로 정규화", source_lang)
+        prepared = await _translate_latest_to_english(messages, _last_user_text(messages))
+
+    started = time.monotonic()
+    data = await call_fm(prepared, MAX_TOKENS)
+    raw = (data["choices"][0]["message"].get("content") or "").strip()
+    content, leaked_think = _clean_content(raw)
+    elapsed = time.monotonic() - started
+
+    if _suspicious(content, expected, elapsed, leaked_think):
+        log.warning(
+            "출력 가드 재시도 — source=%s expected=%s chars=%d elapsed=%.1fs think=%s",
+            source_lang, expected, len(content), elapsed, leaked_think,
+        )
+        retry = await call_fm(_retry_messages(prepared, expected), 1400)
+        retried = (retry["choices"][0]["message"].get("content") or "").strip()
+        content, _ = _clean_content(retried)
+
+    # 재시도도 비정상 장문이면 완전한 문장 경계에서 잘라 무한 출력이 채점기로
+    # 넘어가는 것을 막는다. 정상 응답은 이 경로에 들어오지 않는다.
+    if len(content) > 3500:
+        cut = max(content.rfind(". ", 0, 3500), content.rfind("。", 0, 3500))
+        content = content[: cut + 1 if cut > 1800 else 3500].rstrip()
+
     if not content:
-        log.error("L2 raw 응답의 content가 비었다 — elapsed=%.1fs", dl.elapsed)
+        log.error("L2 응답의 content가 비었다 — elapsed=%.1fs", dl.elapsed)
     return content
 
 
@@ -175,9 +336,12 @@ async def chat_completions(body: dict) -> dict[str, Any]:
     messages = body.get("messages") or []
     dl = Deadline.start(REQUEST_BUDGET_S)
     try:
-        # 단계마다 남은 시간을 보며 스스로 줄이지만, 그래도 넘기면 여기서 끊는다.
+        # 번역 경로는 FM 호출이 하나 더 필요하므로 별도 여유를 준다. 영어·한국어
+        # 대다수 문항의 제한은 기존과 동일하게 유지한다.
+        source_lang = _language(_last_user_text(messages))
+        request_timeout = REQUEST_BUDGET_S + (75 if source_lang not in {"ko", "en"} else 20)
         content = await asyncio.wait_for(
-            generate_reply(messages, dl), timeout=REQUEST_BUDGET_S + 20
+            generate_reply(messages, dl), timeout=request_timeout
         )
     except asyncio.TimeoutError:
         # 여기서 빈 문자열을 흘리면 그 문항은 0점이다. 도구도 라우팅도 없이
