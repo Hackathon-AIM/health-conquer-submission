@@ -128,6 +128,7 @@ async def call_fm(
         "model": FM_MODEL,
         "messages": messages,
         "max_tokens": min(max_tokens, SERVER_MAX_TOKENS),
+        "temperature": 0.3,
         "chat_template_kwargs": {"enable_thinking": ENABLE_THINKING},
         **(extra or {}),
     }
