@@ -26,6 +26,7 @@ import httpx
 from fastapi import FastAPI
 
 from budget import MIN_CALL_S, Deadline, answer_timeout, call_cap
+from capsules import select_capsules
 from generation import generate
 from mcp_client import MCPClient
 from review import REVIEW_MODE, review
@@ -151,6 +152,7 @@ MCP_CONCURRENCY = int(os.environ.get("MCP_CONCURRENCY", "12"))
 #   thinking off → reasoning 0자    + content 576자, finish=stop     (완결, 395토큰)
 # 상한이 2048 로 묶여 있는 한, thinking 을 켜면 긴 답변은 구조적으로 완결될 수 없다.
 ENABLE_THINKING = os.environ.get("FM_THINKING", "0") == "1"
+CAPSULE_ROUTER_ENABLED = os.environ.get("CAPSULE_ROUTER_ENABLED", "1") == "1"
 
 # L2 follows task instructions in the latest user turn more reliably than a
 # separate system message. The second part is the locally validated cv_ctx arm:
@@ -345,7 +347,13 @@ def _with_answer_instruction(messages: list[dict]) -> list[dict]:
     if forwarded and forwarded[-1].get("role") == "user":
         content = forwarded[-1].get("content")
         if isinstance(content, str):
-            forwarded[-1]["content"] = f"{content}\n\n[{ANSWER_INSTRUCTION}]"
+            instructions = [ANSWER_INSTRUCTION]
+            if CAPSULE_ROUTER_ENABLED:
+                capsules = select_capsules(messages)
+                instructions.extend(capsules)
+                if capsules:
+                    log.info("조건부 고위험 capsule 적용")
+            forwarded[-1]["content"] = f"{content}\n\n[{' '.join(instructions)}]"
     return forwarded
 
 
