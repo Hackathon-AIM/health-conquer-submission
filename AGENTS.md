@@ -4,7 +4,9 @@ Conquer Health 해커톤 제출물. 대국민 건강상담 챗봇, HealthBench C
 
 ## 먼저 읽을 것
 
-1. `docs/l2_playbook.md` — 대회 규칙 → 설계 결정, MCP 21종 상황별 사용법, 예산
+0. **`docs/spec.md`** — 대회 사양 원문 SSOT. 엔드포인트·MCP 21종·2단계 계약·제출 제약·CoEval 설정.
+   **사양에 관한 사실은 기억이 아니라 여기서 읽는다.**
+1. `docs/l2_playbook.md` — 규칙 → 설계 결정, MCP 상황별 사용법, 예산 상수의 실측 근거
 2. `.claude/skills/build/references/layer_map.md` — 증상 → 파일 지도
 3. `.claude/skills/verify/references/golden_scenarios.md` — 깨지면 되돌리는 안전 시나리오 5종
 
@@ -21,14 +23,22 @@ Conquer Health 해커톤 제출물. 대국민 건강상담 챗봇, HealthBench C
 
 ## 실행
 
+`make` 가 없는 환경(Windows 등)에서는 `python scripts/mk.py <target>` 이 대신한다.
+
 ```bash
-make setup                                  # .venv
-python scripts/probe_mcp.py                 # MCP 실측 (현장 1순위)
-python serve.py --config configs/l2_live.yaml --port 8080   # 제출물 서버
-python scripts/sim_loop.py --n 3            # Patient Simulator 대화 기록
-make test && make audit                     # 커밋 전 필수
-make ab-baseline                            # l2_raw(기준선) vs l2_live(우리)
+python scripts/mk.py setup        # .venv (uv 우선)
+python scripts/mk.py probe        # MCP 실측 (현장 1순위)
+python scripts/mk.py serve-l2     # 제출물 서버 (configs/l2_live.yaml)
+python scripts/mk.py sim          # Patient Simulator 대화 기록
+python scripts/mk.py test         # 커밋 전 필수
+python scripts/mk.py audit        # 커밋 전 필수
+python scripts/mk.py submit-check # 제출 규격 점검
+python scripts/mk.py ab-baseline  # l2_raw(기준선) vs l2_live(우리)
+python scripts/mk.py list         # 전체 타깃
 ```
+
+⚠️ **`app.py` 와 `submission/` 는 Dockerfile 이 COPY 하지 않는다 = 평가 경로가 아니다.**
+평가되는 것은 `serve.py` → `src/medai/` 뿐이다.
 
 ## 구조 한 줄 요약
 

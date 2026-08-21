@@ -50,10 +50,10 @@ make ab-baseline # 가장 비싸고 가장 중요
 make ab-baseline
 ```
 
-`configs/l1_raw.yaml`(파이프라인 끔) vs `configs/l1.yaml`(우리 것), 같은 조건.
+`configs/l2_raw.yaml`(L2 권장 2단계 그대로, 우리 레이어 없음) vs `configs/l2_live.yaml`(우리 것), 같은 조건.
 
-L1-16B-A3B 단독이 HealthBench-Consensus **93.5%** 를 낸다.
-우리 파이프라인이 그 아래면 finding 을 고칠 게 아니라 **레이어를 꺼야 한다**.
+기준선 절대값은 대시보드 검증 세트에서 직접 잰다. (옛 문서의 "93.5%" 는 L1-16B-A3B 숫자다. 인용 금지.)
+우리 파이프라인이 기준선 아래면 finding 을 고칠 게 아니라 **레이어를 꺼야 한다**.
 `layers.*` 를 하나씩 False 로 바꿔가며 어느 레이어가 마이너스인지 찾는다.
 
 의심 순서: `critic` → `retrieval`(RAG 노이즈) → `dur_output`(과잉 경고) → 템플릿.

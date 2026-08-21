@@ -251,3 +251,31 @@ def test_session_promotes_when_actually_taking():
     plan = QueryPlan(entities=Entities(drugs=[DrugMention(name="타이레놀")]))
     S.update(st, "타이레놀 매일 먹고 있어요", plan, "답변")
     assert "타이레놀" in st.medication_names
+
+
+# ── 제출물 서버: 턴 타임아웃 ────────────────────────────────
+# 회귀 방어. serve.py 에 120 초가 하드코딩돼 있었다. CoEval 클라이언트 timeout 은
+# 360 초인데(docs/spec.md §5.2) llm.timeout 90 × max_retries 4 가 겹치면 정상 응답이
+# 폴백 문구로 바뀐다. 폴백은 그 문항의 가점을 전부 놓치고, 감점은 분모에 없어서
+# 회복이 불가능하다.
+def test_server_turn_timeout_is_configurable():
+    assert "server" in CFG, "config 에 server 섹션이 있어야 한다"
+    assert isinstance(CFG["server"]["turn_timeout"], (int, float))
+
+
+def test_server_turn_timeout_leaves_margin_under_coeval():
+    """대회 split 의 클라이언트 timeout 은 180 초다 (docs/spec.md §5.2).
+
+    180 이상이면 클라이언트가 먼저 끊어 폴백조차 전달되지 않고 그 문항은 0점이 된다
+    (runner.score_inference_failures_as_zero=true). 너무 짧으면 진짜 답이 폴백으로 바뀐다.
+    """
+    for path in ("configs/l2_live.yaml", None):
+        cfg = cfgmod.load(path) if path else CFG
+        t = float(cfg["server"]["turn_timeout"])
+        assert 120.0 < t < 180.0, f"{path or 'DEFAULTS'}: turn_timeout={t}"
+
+
+def test_serve_does_not_hardcode_turn_timeout():
+    src = (Path(__file__).resolve().parents[1] / "serve.py").read_text(encoding="utf-8")
+    assert "fut.result(timeout=_TURN_TIMEOUT)" in src
+    assert "timeout=120" not in src

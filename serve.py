@@ -53,6 +53,7 @@ MODEL_NAME = "medai"
 _PIPE: Pipeline | None = None
 _CFG = None
 _LOOP: asyncio.AbstractEventLoop | None = None
+_TURN_TIMEOUT: float = 300.0     # main() 에서 config 값으로 덮는다
 
 
 # ─────────────────────────────────────────────────────────────
@@ -161,15 +162,23 @@ class Handler(BaseHTTPRequestHandler):
         if not messages:
             return self._send(400, {"error": {"message": "messages required"}})
 
+        fut = None
         try:
             session, text = session_from_messages(messages)
             fut = asyncio.run_coroutine_threadsafe(
                 _PIPE.run_turn(text, session), _LOOP  # type: ignore[arg-type]
             )
-            res = fut.result(timeout=120)
+            # 상한은 config 다 (server.turn_timeout). 하드코딩하지 않는다 —
+            # 짧게 잡으면 '느린 답'이 '날아간 답'이 되고, 폴백 문구는 그 문항의
+            # 가점을 전부 놓친다. 근거: docs/spec.md §5.2 (CoEval timeout 360)
+            res = fut.result(timeout=_TURN_TIMEOUT)
             answer = res.answer
             trace = res.trace
         except Exception as e:
+            # 타임아웃이면 코루틴이 백그라운드 루프에 계속 남는다. 취소해서
+            # 다음 요청의 예산을 갉아먹지 않게 한다.
+            if fut is not None and not fut.done():
+                fut.cancel()
             # 평가 중 500을 내면 그 문항이 통째로 날아간다.
             # 실패해도 안전한 문자열을 돌려주는 편이 낫다.
             answer = ("죄송합니다. 일시적인 오류로 정확한 안내를 드리지 못했습니다. "
@@ -203,7 +212,7 @@ def _run_loop(loop: asyncio.AbstractEventLoop) -> None:
 
 
 def main() -> None:
-    global _PIPE, _CFG, _LOOP
+    global _PIPE, _CFG, _LOOP, _TURN_TIMEOUT
     ap = argparse.ArgumentParser(description="OpenAI 호환 서버 (제출물)")
     # ★ 제출 규정: 컨테이너는 수동 작업 없이 0.0.0.0:8000 에서 서비스해야 한다.
     #   그래서 기본값을 8000 / configs/l2_live.yaml 로 두고, 환경변수로 덮을 수 있게 한다.
@@ -215,6 +224,7 @@ def main() -> None:
 
     _CFG = cfgmod.load(a.config)
     _PIPE = Pipeline(_CFG)
+    _TURN_TIMEOUT = float(_CFG["server"]["turn_timeout"])
 
     # 파이프라인은 async 라 백그라운드 이벤트 루프에서 돌리고,
     # HTTP 스레드는 run_coroutine_threadsafe 로 결과를 받는다.
@@ -227,6 +237,7 @@ def main() -> None:
     print(f"  config      : {a.config} ({_CFG.get('name')})")
     print(f"  retrieval   : {_CFG['retrieval']['mode']}")
     print(f"  FM base_url : {_CFG['llm']['base_url'] or '(미설정 — 오프라인 스텁)'}")
+    print(f"  turn timeout: {_TURN_TIMEOUT:.0f}s (conquer_val/test 클라이언트는 180s)")
     print()
     print("  CoEval 연결:")
     print(f"    mise run eval -- datasets=healthbench_consensus \\")

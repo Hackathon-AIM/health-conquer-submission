@@ -67,9 +67,11 @@ r"(?<![가-힣])술(?![기의])"   # ✅
 새 패턴마다 `tests/test_gates.py` 에 "걸리면 안 되는 문장" 케이스를 같이 넣는다.
 
 ### 사전은 창작하지 않는다
-`data/redflags.yaml`, `drug_map.json`, `risk_rules.yaml` 항목의 출처는
-식약처 허가사항 · DUR 고시 · HealthBench 역추출(`make redflags`) 뿐이다.
+`data/redflags.yaml`, `drug_map.json`, `risk_rules.yaml` 항목의 허용 출처는
+**식약처 허가사항 · DUR 고시 · 응급의학 공개 임상 기준** 뿐이다.
 손으로 지어낸 항목은 오탐이 되고, 오탐은 감점이 된다.
+
+❌ **HealthBench 역추출 금지** — 대회 규칙 7, 수상 자격 박탈 사유. `make redflags` 는 폐기됐다.
 
 ### drafter 는 고정
 `models.drafter` 가 심사 대상 텍스트를 쓴다. 대회 FM 에서 바꾸지 않는다.

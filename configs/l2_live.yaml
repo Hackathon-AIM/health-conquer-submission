@@ -29,6 +29,12 @@ models:
   extractor:  "Lunit/L2-preview"
   grader:     "Lunit/L2-preview"   # 로컬 자체 평가용. 대회 judge 는 저쪽 것
 
+server:
+  # 한 턴 벽시계 상한. 대회 split(conquer_val/test)의 클라이언트 timeout 이 180초다
+  # (docs/spec.md §5.2). 180 을 넘기면 클라이언트가 먼저 끊고 그 문항은 0점 처리된다
+  # (score_inference_failures_as_zero: true). 165 = 왕복 여유 15초.
+  turn_timeout: 165.0
+
 layers:
   l2_native: true          # ★ L4 를 L2 2단계(검색→생성)로. L3/rerank 자동 우회
   redflag: true

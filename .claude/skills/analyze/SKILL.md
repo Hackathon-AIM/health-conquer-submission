@@ -62,10 +62,10 @@ trace.violations 가 비었는데 답이 나쁜가? → L4c 비평 항목 부재
 ## 5. 파이프라인 자체를 의심한다
 
 레이어 하나하나가 아니라 **파이프라인이 있는 게 손해**일 수 있다.
-raw 모델(L1-16B-A3B)이 HealthBench-Consensus 93.5% 를 이미 낸다.
+기준선은 `configs/l2_raw.yaml` — L2 권장 2단계 사용법 그대로, 우리 레이어 없이.
 
 ```bash
-make ab-baseline    # raw vs 우리 파이프라인, 같은 50문항
+python scripts/mk.py ab-baseline    # l2_raw vs l2_live, 같은 50문항
 ```
 
 파이프라인이 낮으면 그게 최우선 finding 이다. 흔한 원인 세 가지:

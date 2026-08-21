@@ -62,19 +62,31 @@ qa 로 골든 시나리오 5종 + make test + make audit 돌리고 판정문 내
 
 **기준선 점검 (하루 한 번은 돈다)**
 ```
-qa 로 make ab-baseline 돌려서 우리 파이프라인이 raw L1 의 93.5% 를 넘는지 확인해줘.
+qa 로 ab-baseline 돌려서 우리 파이프라인(l2_live)이 기준선(l2_raw)을 넘는지 확인해줘.
 못 넘으면 어느 레이어가 마이너스인지 layers 스위치 하나씩 꺼가며 찾아줘.
+```
+
+**제출 게이트 (커밋 전마다)**
+```
+spec 스킬로 제출 규격 점검해줘. 포트·브랜치·빌드 시간·엔드포인트 전부.
 ```
 
 ## 산출물 구조
 
 ```
+CLAUDE.md                      # ★ 진입 계약 — 절대 규칙 · 평가 경로 · 실행 명령
+docs/spec.md                   # ★ 대회 사양 원문 SSOT (사실은 전부 여기서 읽는다)
+scripts/mk.py                  # make 대체 (이 머신에 make 가 없다)
+
 .claude/
 ├── agents/                    # 에이전트 정의
 │   ├── analyst.md             # 분석 에이전트
 │   ├── builder.md             # 개발 에이전트
 │   └── qa.md                  # QA 에이전트
 ├── skills/                    # 스킬 파일
+│   ├── spec/                  # ★ 사양 조회 · 제출 게이트
+│   │   ├── SKILL.md
+│   │   └── references/mcp_playbook.md
 │   ├── analyze/
 │   │   ├── SKILL.md
 │   │   └── references/rubric_map.md
@@ -86,6 +98,18 @@ qa 로 make ab-baseline 돌려서 우리 파이프라인이 raw L1 의 93.5% 를
 │       └── references/golden_scenarios.md
 └── harness.md                 # 이 파일 — 팀 구성 근거
 ```
+
+## 왜 `spec` 스킬이 따로 있는가
+
+analyst·builder·qa 는 전부 **"우리 코드가 어떤가"** 를 본다. 아무도
+**"대회가 뭘 요구했는가"** 를 보지 않는다. 그 결과 두 종류의 사고가 난다:
+
+1. **규격 위반 = 0점.** 점수를 아무리 올려도 포트·브랜치·빌드 시간을 어기면 전부 무효다.
+2. **사양을 기억으로 답하기.** CoEval Hydra 경로를 `client.api_base` 로 알고 있다가
+   `Key 'api_base' is not in struct` 에서 반나절을 태우는 식이다.
+
+`spec` 은 에이전트가 아니라 스킬이다 — 판단이 아니라 **조회**이기 때문이다.
+누가 부르든 답이 같아야 하고, 답의 출처는 `docs/spec.md` 한 곳이어야 한다.
 
 `references/` 는 Progressive Disclosure 다. SKILL.md 는 짧게 유지하고,
 표와 사례는 필요할 때만 읽히도록 분리한다. 컨텍스트가 절약되는 만큼
