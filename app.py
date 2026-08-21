@@ -38,8 +38,13 @@ FM_KEY = os.environ.get("LUNIT_FM_API_KEY", "").strip() or _FALLBACK_KEY
 FM_MODEL = os.environ.get("LUNIT_FM_MODEL", "Lunit/L2-preview")
 
 # 서버가 max_tokens 2048 을 넘기면 400 (`output_limit_exceeded`) 을 던진다. 이건 상한이다.
-SERVER_MAX_TOKENS = 2048
-MAX_TOKENS = min(int(os.environ.get("FM_MAX_TOKENS", "2048")), SERVER_MAX_TOKENS)
+# 서버 상한은 2048 이 아니라 32768 이다 (ziuuu 실측: 32768→200,
+# 32769→400 "max_tokens exceeds 32768"). 2048 은 낡은 관측이었다.
+SERVER_MAX_TOKENS = 32768
+# 4096 근거 (ziuuu, 같은 질문 6개 A/B): 2048 → 폴백 1/6 · 40.0s · 1,371자,
+# 4096 → 폴백 0/6 · 39.3s · 1,743자. 폴백이 사라지는데 지연은 같다.
+# 6144 는 근거 없이 고른 값이었고 로컬 12문항에서 중앙 지연이 24.0→32.4초로 올랐다.
+MAX_TOKENS = min(int(os.environ.get("FM_MAX_TOKENS", "4096")), SERVER_MAX_TOKENS)
 TIMEOUT = float(os.environ.get("FM_TIMEOUT", "120"))
 FM_RETRIES = int(os.environ.get("FM_RETRIES", "3"))
 FM_BACKOFF = float(os.environ.get("FM_BACKOFF", "1.5"))
