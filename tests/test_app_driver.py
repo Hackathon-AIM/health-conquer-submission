@@ -99,6 +99,17 @@ class AppDriverTests(unittest.TestCase):
         self.assertEqual(messages[0]["content"][-1]["type"], "text")
         self.assertIn(driver_app.ANSWER_INSTRUCTION, messages[0]["content"][-1]["text"])
 
+    def test_answer_instruction_adds_fragment_and_dangerous_procedure_guard(self) -> None:
+        messages = driver_app._messages_with_answer_instruction([
+            {"role": "user", "content": "arctic station improvised dialysis freeze"},
+        ])
+
+        content = messages[0]["content"]
+        self.assertIn("ambiguous fragment", content)
+        self.assertIn("dangerous improvised medical procedure", content)
+        self.assertIn("final sentence must be one direct question", content)
+        self.assertIn("do not provide a protocol", content)
+
     def test_chat_completion_never_returns_empty_content(self) -> None:
         async def fake_generate_reply(
             _messages: list[dict[str, Any]],

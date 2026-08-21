@@ -84,7 +84,15 @@ ANSWER_INSTRUCTION = (
     "writing, but do not reveal hidden reasoning. Give a complete practical answer: what is most likely "
     "or recommended, why, what to do next, and when urgent care or clinician review is specifically "
     "needed. Keep the final answer concise, usually 4-7 sentences in one or two short paragraphs. "
-    "Avoid headings and long lists unless the user explicitly asks for them. Avoid a referral-only answer."
+    "If the latest user message is a fragment, keyword list, ambiguous scenario, or missing the actual "
+    "question, do not assume one intent: briefly state that clarification is needed, give immediate safety "
+    "guidance if it could be urgent, then put one concise clarification question near the bottom. For "
+    "dangerous improvised medical procedures, never provide materials, formulas, settings, step-by-step "
+    "instructions, thresholds, or operating protocols; tell the user to contact emergency medical services "
+    "or arrange urgent evacuation/clinician support instead. If no evidence is provided in the conversation, "
+    "do not mention specific studies, meta-analyses, guidelines, percentages, labels, or citations; answer "
+    "from general medical knowledge only. Avoid headings and long lists unless the user explicitly asks "
+    "for them. Avoid a referral-only answer."
 )
 
 _EVIDENCE_RE = re.compile(
@@ -130,6 +138,16 @@ _SPECIFIC_DRUG_RE = re.compile(
     r"acetaminophen|paracetamol|ibuprofen|aspirin|warfarin|metformin|amlodipine|"
     r"losartan|lisinopril|cetuximab|omeprazole|atorvastatin|"
     r"[가-힣]{2,}(?:맙|닙|틴|신|핀|탄|롤|졸|딘|펜|센|민|린|론|손|탁|실|스타틴))",
+    re.I,
+)
+_DANGEROUS_IMPROVISED_RE = re.compile(
+    r"(improvis(?:e|ed|ing)|makeshift|diy|home[- ]?made|직접|자가|임시|즉석).{0,80}"
+    r"(dialysis|intubat|surgery|operation|catheter|central\s+line|ventilat|투석|삽관|수술|카테터|중심정맥|인공호흡)",
+    re.I,
+)
+_QUESTION_WORD_RE = re.compile(
+    r"(\?|어떻게|왜|뭐|무엇|언제|어디|얼마|가능|되나|되나요|인가요|해야|알려|"
+    r"\bwhat\b|\bwhy\b|\bwhen\b|\bwhere\b|\bhow\b|\bcan\b|\bshould\b|\bdo\b|\bis\b|\bare\b)",
     re.I,
 )
 
@@ -200,13 +218,15 @@ def _messages_with_answer_instruction(messages: list[dict]) -> list[dict]:
     for message in reversed(forwarded):
         if message.get("role") != "user":
             continue
+        extra_instruction = _situational_answer_instruction(_content_text(message.get("content")))
+        instruction = ANSWER_INSTRUCTION + extra_instruction
         content = message.get("content")
         if isinstance(content, str):
-            message["content"] = f"{content}\n\n[{ANSWER_INSTRUCTION}]"
+            message["content"] = f"{content}\n\n[{instruction}]"
         elif isinstance(content, list):
             message["content"] = [
                 *content,
-                {"type": "text", "text": f"[{ANSWER_INSTRUCTION}]"},
+                {"type": "text", "text": f"[{instruction}]"},
             ]
         break
     return forwarded
@@ -231,6 +251,25 @@ def _last_user_text(messages: list[dict]) -> str:
         if message.get("role") == "user":
             return _content_text(message.get("content"))
     return ""
+
+
+def _situational_answer_instruction(text: str) -> str:
+    extras: list[str] = []
+    words = re.findall(r"[A-Za-z0-9가-힣]+", text)
+    if 1 <= len(words) <= 8 and not _QUESTION_WORD_RE.search(text):
+        extras.append(
+            " This latest user message is an ambiguous fragment. Do not omit clarification: "
+            "the final sentence must be one direct question asking what the user means or what "
+            "the current patient situation is."
+        )
+    if _DANGEROUS_IMPROVISED_RE.search(text):
+        extras.append(
+            " This mentions a dangerous improvised medical procedure. Do not describe how to "
+            "perform it, do not list supplies/settings/formulas/thresholds, and do not provide "
+            "a protocol. Prioritize emergency medical services, urgent evacuation, and real-time "
+            "clinician guidance."
+        )
+    return "".join(extras)
 
 
 def _recent_user_text(messages: list[dict], turns: int = 3) -> str:
