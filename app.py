@@ -162,42 +162,11 @@ async def call_fm(
 
 
 async def generate_reply(messages: list[dict], dl: Deadline) -> str:
-    route = await classify(messages, call_fm)
-    log.info(
-        "route: domain=%s urgency=%s context=%s persona=%s date=%s src=%s tools=%d",
-        route.domain, route.urgency, route.context, route.persona,
-        route.date_sensitive, route.source, len(route.tools),
-    )
-
-    # 결정적 맥락이 빠졌고 응급도 아니면, 답을 지어내지 말고 하나만 되묻는다.
-    # 09 문서 §4 — 맥락인지는 Consensus 두 번째로 큰 축(24.7%)이고 프론티어가 무너지는 곳이다.
-    if route.context == "missing_critical" and route.ask_back:
-        return route.ask_back
-
-    # 응급이면 검색을 짧게 끊는다. 실측에서 예산 6회를 다 쓰고 31초가 걸렸는데,
-    # 정작 근거는 "약물 부작용 자료에서 확인되지 않음"이라 답에 보탬이 없었다.
-    # 응급에서 값을 내는 건 근거 인용이 아니라 즉시 의뢰다.
-    budget = EMERGENCY_BUDGET if route.urgency == "emergency" else RETRIEVAL_BUDGET
-
-    # 라우터에서 이미 시간을 많이 썼으면 검색을 통째로 건너뛴다. 근거 있는 답보다
-    # 답이 있는 것이 먼저다 — 빈 응답은 채점에서 0점이고, 실측으로 그걸 봤다.
-    if dl.expired(reserve=ANSWER_RESERVE_S):
-        log.warning("시간이 모자라 검색을 건너뛴다 (남은 %.0fs)", dl.remaining())
-        route.tools = []
-
-    content, _ = await generate(
-        messages, route, call_fm, MCP, MAX_TOKENS, budget, dl, ANSWER_RESERVE_S
-    )
-
-    # content 가 비는 건 대개 reasoning 이 예산을 다 먹고 잘린 경우다.
-    # max_tokens 를 더 올릴 수는 없으므로(2048 이 상한), 도구 없이 한 번 더 시도한다.
+    """Evaluator의 대화를 수정하지 않고 L2에 그대로 전달하는 기준선."""
+    data = await call_fm(messages, MAX_TOKENS)
+    content = (data["choices"][0]["message"].get("content") or "").strip()
     if not content:
-        log.warning("빈 content — 도구 없이 재시도 (elapsed %.0fs)", dl.elapsed)
-        data = await call_fm(messages, MAX_TOKENS)
-        content = (data["choices"][0]["message"].get("content") or "").strip()
-
-    if not content:
-        log.error("빈 content 로 응답한다 — elapsed=%.1fs", dl.elapsed)
+        log.error("L2 raw 응답의 content가 비었다 — elapsed=%.1fs", dl.elapsed)
     return content
 
 
