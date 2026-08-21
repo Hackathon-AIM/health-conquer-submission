@@ -4,10 +4,11 @@
 이 서버가 다음 assistant 응답을 돌려준다.
 
 요청 하나의 흐름:
-  1. 라우터가 도메인·응급도·페르소나를 정하고 도메인에 맞는 MCP 도구만 고른다
-  2. retrieval 이 그 도구로 근거를 모아 cite_uid 를 확정한다
-  3. generation 이 근거를 컨텍스트에 얹어 답을 쓴다
-  4. verify 가 내보내기 전에 답을 한 번 더 검사하고, 필요하면 고친다
+  1. 초안 — PIPELINE 이 경로를 고른다
+       raw     : 대화를 그대로 L2 에 넘기고 thinking 으로 한 번에 받는다 (기본)
+       harness : 라우팅 → MCP 근거 검색 → 근거를 얹어 생성
+  2. 검증 — review 가 내보내기 전에 "질문에 답했는가"와 "이상한 데가 없는가"를 본다.
+       규칙에 걸린 것만 L2 에게 되묻는다. 정상 답변에는 추가 호출이 없다.
 
 단계마다 남은 시간을 보고 스스로 줄인다. 답을 못 내는 것이 가장 나쁘므로
 어느 단계가 실패해도 그때까지 만든 답으로 내려간다.
@@ -16,6 +17,7 @@
 import asyncio
 import logging
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 from typing import Any
@@ -26,8 +28,8 @@ from fastapi import FastAPI
 from budget import MIN_CALL_S, Deadline, answer_timeout, call_cap
 from generation import generate
 from mcp_client import MCPClient
+from review import REVIEW_MODE, review
 from router import classify
-from verify import verify
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("driver")
@@ -44,9 +46,14 @@ FM_URL = os.environ.get("LUNIT_FM_API_URL", "https://model.hackathon.lunit.io").
 FM_KEY = os.environ.get("LUNIT_FM_API_KEY", "").strip() or _FALLBACK_KEY
 FM_MODEL = os.environ.get("LUNIT_FM_MODEL", "Lunit/L2-preview")
 
-# 서버가 max_tokens 2048 을 넘기면 400 (`output_limit_exceeded`) 을 던진다. 이건 상한이다.
-SERVER_MAX_TOKENS = 2048
-MAX_TOKENS = min(int(os.environ.get("FM_MAX_TOKENS", "2048")), SERVER_MAX_TOKENS)
+# 서버 상한 실측: 32768 은 200, 32769 는 400 "max_tokens exceeds 32768".
+# 2048 이라는 전제 때문에 thinking 응답이 늘 finish=length 로 잘려 폴백으로 떨어지고
+# 있었다. 팀 실측(동시 30, 같은 트리 두 벌):
+#   2048 → thinking 폴백 5회 · 평균 1673자 · 37.4s
+#   4096 → thinking 폴백 0회 · 평균 1773자 · 38.5s
+# 4096 을 넘기지 않는 이유는 REQUEST_BUDGET_S+20 = 60초 하드컷 때문이다.
+SERVER_MAX_TOKENS = 32768
+MAX_TOKENS = min(int(os.environ.get("FM_MAX_TOKENS", "4096")), SERVER_MAX_TOKENS)
 TIMEOUT = float(os.environ.get("FM_TIMEOUT", "120"))
 FM_RETRIES = int(os.environ.get("FM_RETRIES", "3"))
 FM_BACKOFF = float(os.environ.get("FM_BACKOFF", "1.5"))
@@ -66,6 +73,18 @@ ANSWER_RESERVE_S = float(os.environ.get("ANSWER_RESERVE_S", "18"))
 # 출력 검증 몫. 검색은 답변 몫과 이 몫을 둘 다 남기고 멈춰야 한다.
 # 남은 시간이 이보다 적으면 리뷰 호출을 건너뛰고 규칙 검사만 돌린다.
 VERIFY_RESERVE_S = float(os.environ.get("VERIFY_RESERVE_S", "8"))
+
+# ── 초안 경로 선택 ────────────────────────────────────────────
+#
+#   raw     : L2 에게 대화를 그대로 넘기고 thinking 으로 한 번에 답을 받는다.
+#             팀 실측에서 가장 높은 점수가 나온 경로다(50.03). 도구를 쓰지 않는다.
+#   harness : 라우팅 → MCP 근거 검색 → 근거를 얹어 생성. 근거·인용이 필요한
+#             질문에서 값을 내지만, 요청당 상류 호출이 늘어 지연 위험이 크다.
+#             과거 이 경로의 계보가 38.34 였고, 느려서 0.00 을 받은 적도 있다.
+#
+# 기본을 raw 로 두는 이유는 하나다 — 측정된 최고점이 거기 있다.
+# harness 는 CoEval 로 재고 나서 켜는 것이 맞다.
+PIPELINE = os.environ.get("PIPELINE", "raw").strip().lower()
 
 # ── 시간 예산 가드 ────────────────────────────────────────────
 # 예산을 40초로 정해 놓고도 그 예산이 지켜지지 않던 이유가 여기 있었다.
@@ -89,7 +108,14 @@ ANSWER_FLOOR_S = float(os.environ.get("ANSWER_FLOOR_S", "25"))
 
 # 어떤 이유로든 본 경로가 실패했을 때의 구조 호출. 이 호출의 목적은 품질이
 # 아니라 0점 회피다.
+#
+# ★ 구조 호출은 **짧은 답**을 요구해야 한다. 실측에서 초안이 40초에 끊긴 뒤
+#   구조 호출까지 4096토큰을 요구했다가 30초 안에 못 받아 빈 답이 나왔다.
+#   4096토큰은 생성만으로도 수십 초다 — 이미 시간이 없어서 여기 온 건데 같은
+#   길이를 다시 요구하는 것은 앞의 실패를 반복하겠다는 뜻이다.
+#   짧은 답은 감점이지만 빈 답은 0점이다.
 RESCUE_CAP_S = float(os.environ.get("RESCUE_CAP_S", "30"))
+RESCUE_MAX_TOKENS = int(os.environ.get("RESCUE_MAX_TOKENS", "1024"))
 
 # 우리 스스로를 밀어내지 않도록 상류 호출을 조인다. 요청 하나가 FM 을 최대 9회,
 # MCP 를 6회까지 부르기 때문에 동시 요청이 몰리면 상류가 먼저 무너진다.
@@ -131,8 +157,10 @@ async def lifespan(_: FastAPI):
     if not FM_KEY:
         log.error("LUNIT_FM_API_KEY 가 비어 있다. 모든 생성 요청이 실패한다.")
     log.info(
-        "driver up — model=%s max_tokens=%d thinking=%s budget=%.0fs fm_conc=%d mcp_conc=%d",
-        FM_MODEL, MAX_TOKENS, ENABLE_THINKING, REQUEST_BUDGET_S, FM_CONCURRENCY, MCP_CONCURRENCY,
+        "driver up — model=%s max_tokens=%d pipeline=%s review=%s budget=%.0fs "
+        "fm_conc=%d mcp_conc=%d guard=%s",
+        FM_MODEL, MAX_TOKENS, PIPELINE, REVIEW_MODE, REQUEST_BUDGET_S,
+        FM_CONCURRENCY, MCP_CONCURRENCY, DEADLINE_GUARD,
     )
     try:
         yield
@@ -249,10 +277,22 @@ def _timed(call, timeout: float | None):
     return _call
 
 
-async def _direct_answer(messages: list[dict], dl: Deadline) -> str:
-    """라우팅도 검색도 없이 답만 받는다. 시간이 없을 때의 마지막 경로다."""
+async def _direct_answer(
+    messages: list[dict], dl: Deadline, max_tokens: int | None = None
+) -> str:
+    """라우팅도 검색도 없이 답만 받는다. 시간이 없을 때의 마지막 경로다.
+
+    `max_tokens` 를 줄여 부르면 생성 시간 자체가 줄어든다. 시간이 없어서 여기
+    왔으므로 길이를 낮추는 것이 이 경로가 성공할 확률을 직접 올린다.
+    thinking 도 끈다 — 사고 토큰이 예산의 대부분을 먹는다.
+    """
     t = answer_timeout(dl, ANSWER_CAP_S, ANSWER_FLOOR_S) if DEADLINE_GUARD else None
-    data = await call_fm(_with_answer_instruction(messages), MAX_TOKENS, timeout=t)
+    data = await call_fm(
+        _with_answer_instruction(messages),
+        max_tokens or MAX_TOKENS,
+        {"chat_template_kwargs": {"enable_thinking": False}},
+        timeout=t,
+    )
     return (data["choices"][0]["message"].get("content") or "").strip()
 
 
@@ -265,6 +305,11 @@ def _last_user_text(messages: list[dict]) -> str:
     return ""
 
 
+def _lang_of(text: str) -> str:
+    """답변 언어는 질문 언어를 따른다. 불일치는 의사소통 축에서 그대로 감점이다."""
+    return "ko" if re.search(r"[가-힣]", text) else "en"
+
+
 def _with_answer_instruction(messages: list[dict]) -> list[dict]:
     """최신 사용자 턴에만 답변 행동 지시를 붙인다. 히스토리는 건드리지 않는다."""
     forwarded = [dict(message) for message in messages]
@@ -275,14 +320,62 @@ def _with_answer_instruction(messages: list[dict]) -> list[dict]:
     return forwarded
 
 
-async def generate_reply(messages: list[dict], dl: Deadline) -> str:
-    """라우팅 → MCP 근거 검색 → 생성 → 출력 검증 순으로 다음 발화를 만든다."""
-    # 분류부터 시간에 묶는다. 여기서 늦어지면 검색·답변·검증이 전부 밀린다.
+async def _draft_raw(messages: list[dict], dl: Deadline) -> tuple[str, str, int, str]:
+    """SOTA 경로 — 대화를 그대로 L2 에 넘기고 thinking 으로 답을 받는다.
+
+    thinking 응답이 max_tokens 에 걸려 잘리면 thinking 없이 한 번 더 받는다.
+    돌려주는 것: (초안, 답변 언어, 근거 개수=0, 근거 텍스트="")
+    """
+    forwarded = _with_answer_instruction(messages)
+    cap = answer_timeout(dl, ANSWER_CAP_S, ANSWER_FLOOR_S) if DEADLINE_GUARD else None
+    try:
+        data = await call_fm(
+            forwarded,
+            MAX_TOKENS,
+            {"chat_template_kwargs": {"enable_thinking": True}},
+            timeout=cap,
+        )
+    except Exception as e:  # noqa: BLE001
+        # thinking 호출이 시간에 걸렸다. 예외를 올리면 요청 전체가 구조 경로로
+        # 떨어지는데 그쪽은 시간이 더 없다. 같은 자리에서 thinking 을 끄고 짧게
+        # 다시 받는 편이 훨씬 산다.
+        log.warning(
+            "thinking 호출 실패(%s) — thinking 없이 짧게 다시 받는다 (elapsed=%.1fs)",
+            type(e).__name__,
+            dl.elapsed,
+        )
+        return (
+            await _direct_answer(messages, dl, RESCUE_MAX_TOKENS),
+            _lang_of(_last_user_text(messages)),
+            0,
+            "",
+        )
+    choice = data["choices"][0]
+    content = (choice["message"].get("content") or "").strip()
+    if choice.get("finish_reason") == "length" or not content:
+        log.info(
+            "thinking 응답 손상 — 기존 경로로 폴백 (finish=%s content=%d elapsed=%.1fs)",
+            choice.get("finish_reason"), len(content), dl.elapsed,
+        )
+        cap = answer_timeout(dl, ANSWER_CAP_S, ANSWER_FLOOR_S) if DEADLINE_GUARD else None
+        data = await call_fm(
+            forwarded, MAX_TOKENS, {"chat_template_kwargs": {"enable_thinking": False}}, timeout=cap
+        )
+        content = (data["choices"][0]["message"].get("content") or "").strip()
+    return content, _lang_of(_last_user_text(messages)), 0, ""
+
+
+async def _draft_harness(messages: list[dict], dl: Deadline) -> tuple[str, str, int, str]:
+    """하네스 경로 — 라우팅 → MCP 근거 검색 → 근거를 얹어 생성.
+
+    돌려주는 것: (초안, 답변 언어, 근거 개수, 근거 텍스트)
+    """
     keep = ANSWER_RESERVE_S + VERIFY_RESERVE_S
     if DEADLINE_GUARD and dl.expired(reserve=keep):
         # 답 쓸 시간만 남았다. 라우팅을 포기하고 답을 낸다 — 빈 답이 가장 나쁘다.
         log.info("분류 생략 — 남은 %.1fs 로 직답", dl.remaining())
-        return await _direct_answer(messages, dl)
+        content = await _direct_answer(messages, dl)
+        return content, _lang_of(_last_user_text(messages)), 0, ""
 
     route = await classify(
         messages,
@@ -310,26 +403,45 @@ async def generate_reply(messages: list[dict], dl: Deadline) -> str:
         answer_cap=ANSWER_CAP_S,
         answer_floor=ANSWER_FLOOR_S,
     )
+    n_ev = len(retr.items) if retr else 0
+    return content, route.lang, n_ev, (retr.as_prompt() if retr else "")
+
+
+async def generate_reply(messages: list[dict], dl: Deadline) -> str:
+    """초안을 만들고, 내보내기 전에 출력 검증층을 한 번 통과시킨다.
+
+    초안 경로는 PIPELINE 이 정하고, 검증층은 두 경로가 같은 것을 쓴다.
+    검증층은 대부분의 요청에서 FM 을 부르지 않는다 — 규칙에 걸린 것만 되묻는다.
+    """
+    draft_fn = _draft_harness if PIPELINE == "harness" else _draft_raw
+    content, lang, n_evidence, evidence = await draft_fn(messages, dl)
     if not content:
-        log.error("generation 이 빈 content 를 냈다 — elapsed=%.1fs", dl.elapsed)
+        log.error("초안이 비었다 (pipeline=%s) — elapsed=%.1fs", PIPELINE, dl.elapsed)
         return content
 
-    content, issues = await verify(
+    if REVIEW_MODE == "off":
+        return content
+
+    before = len(content)
+    reviewed, notes = await review(
         content,
         _last_user_text(messages),
-        retr.as_prompt() if retr else "",
-        len(retr.items) if retr else 0,
-        _timed(call_fm, call_cap(dl, FM_CALL_CAP_S) if DEADLINE_GUARD else None),
-        MAX_TOKENS,
-        lang=route.lang,
-        deadline=dl,
-        reserve=VERIFY_RESERVE_S,
+        call_fm,
+        lang=lang,
+        deadline=dl if DEADLINE_GUARD else None,
+        n_evidence=n_evidence,
+        evidence=evidence,
     )
-    if issues:
-        log.info("검증 지적 %d건: %s", len(issues), "; ".join(issues)[:300])
-    if not content:
-        log.error("검증 후 content 가 비었다 — elapsed=%.1fs", dl.elapsed)
-    return content
+    if notes:
+        log.info(
+            "검증 %d→%d자 · 근거 %d건 · 신호 %d건: %s",
+            before, len(reviewed), n_evidence, len(notes), "; ".join(notes)[:300],
+        )
+    if not reviewed:
+        # 검증층은 절대 빈 답을 만들면 안 된다. 왔다면 버그이므로 초안을 지킨다.
+        log.error("검증이 빈 답을 냈다 — 초안 유지 (elapsed=%.1fs)", dl.elapsed)
+        return content
+    return reviewed
 
 
 @app.post("/v1/chat/completions")
@@ -350,7 +462,7 @@ async def chat_completions(body: dict) -> dict[str, Any]:
                     type(e).__name__, dl.elapsed)
         try:
             content = await asyncio.wait_for(
-                _direct_answer(messages, dl), timeout=RESCUE_CAP_S + 10
+                _direct_answer(messages, dl, RESCUE_MAX_TOKENS), timeout=RESCUE_CAP_S + 10
             )
         except Exception:
             # 평가 하네스에 5xx 를 돌려주면 대화 전체가 깨질 수 있다.
