@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from budget import answer_timeout, call_cap
 from retrieval import RetrievalResult, run_retrieval
 
 log = logging.getLogger("generation")
@@ -89,14 +90,24 @@ async def generate(
     budget: int = 6,
     deadline=None,
     reserve: float = 25.0,
+    answer_cap: float = 45.0,
+    answer_floor: float = 25.0,
 ) -> tuple[str, RetrievalResult | None]:
-    """generation 단계를 돌린다. 모델이 도구를 부르면 그 안에서 retrieval 을 실행한다."""
+    """generation 단계를 돌린다. 모델이 도구를 부르면 그 안에서 retrieval 을 실행한다.
+
+    `reserve` 는 검색을 언제 끊을지의 기준(답변+검증 몫)이고, `answer_cap` 은
+    **최종 답변 호출 하나**에 걸 상한이다. 답변 호출에는 reserve 를 걸지 않는다 —
+    이 호출이 곧 답이라, 여기서 아껴 봐야 아낄 대상이 없다. 검증은 자기 몫이
+    남지 않으면 규칙 검사만 돌리도록 스스로 물러난다.
+    """
     convo: list[dict] = [{"role": "system", "content": generation_system(route)}]
     convo.extend(messages)
 
     # 검색할 게 없는 도메인(generic)이면 그대로 답한다.
     if not route.tools:
-        data = await call_fm(convo, max_tokens)
+        data = await call_fm(
+            convo, max_tokens, timeout=answer_timeout(deadline, answer_cap, answer_floor)
+        )
         return (data["choices"][0]["message"].get("content") or "").strip(), None
 
     # 원래는 여기서 모델에게 retrieve_relevant_content 를 주고, 모델이 질의를 만들어
@@ -130,7 +141,9 @@ async def generate(
             ),
         },
     )
-    data = await call_fm(convo, max_tokens)
+    data = await call_fm(
+        convo, max_tokens, timeout=answer_timeout(deadline, answer_cap, answer_floor)
+    )
     content = (data["choices"][0]["message"].get("content") or "").strip()
     return content, result
 

@@ -16,13 +16,14 @@
 import asyncio
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
 from fastapi import FastAPI
 
-from budget import Deadline
+from budget import MIN_CALL_S, Deadline, answer_timeout, call_cap
 from generation import generate
 from mcp_client import MCPClient
 from router import classify
@@ -65,6 +66,30 @@ ANSWER_RESERVE_S = float(os.environ.get("ANSWER_RESERVE_S", "18"))
 # 출력 검증 몫. 검색은 답변 몫과 이 몫을 둘 다 남기고 멈춰야 한다.
 # 남은 시간이 이보다 적으면 리뷰 호출을 건너뛰고 규칙 검사만 돌린다.
 VERIFY_RESERVE_S = float(os.environ.get("VERIFY_RESERVE_S", "8"))
+
+# ── 시간 예산 가드 ────────────────────────────────────────────
+# 예산을 40초로 정해 놓고도 그 예산이 지켜지지 않던 이유가 여기 있었다.
+# 호출 하나의 timeout(FM 120s · MCP 60s)이 요청 전체 예산보다 크고, 거기에
+# 재시도 3회가 곱해진다. 최악은 FM 한 번이 120×3+백오프 ≈ 365초다.
+# 예산은 "언제 멈출지" 만 정했고 "얼마나 기다릴지" 는 아무도 정하지 않았다.
+#
+# 가드를 켜면 모든 상류 호출의 timeout 을 남은 시간에서 깎아 만든다. 재시도까지
+# 합쳐서 그 상한을 넘지 않는다. 0 으로 두면 예전 동작 그대로다(A/B 용).
+DEADLINE_GUARD = os.environ.get("DEADLINE_GUARD", "1") == "1"
+
+# 단계별 호출 하나의 상한. 남은 시간이 이보다 적으면 남은 시간 쪽이 이긴다.
+CLASSIFY_CAP_S = float(os.environ.get("CLASSIFY_CAP_S", "12"))
+FM_CALL_CAP_S = float(os.environ.get("FM_CALL_CAP_S", "25"))
+
+# 최종 답변 호출만은 남은 시간으로 깎지 않는다. 예산은 답을 지키려고 있는 것이라
+# 그걸로 답변을 깎으면 앞 단계가 흘린 시간만큼 답이 굶는다. 실측: 동시 30건에서
+# 답변 호출을 remaining 으로 깎았더니 6/30 이 빈 답(=0점)이 됐다.
+ANSWER_CAP_S = float(os.environ.get("ANSWER_CAP_S", "45"))
+ANSWER_FLOOR_S = float(os.environ.get("ANSWER_FLOOR_S", "25"))
+
+# 어떤 이유로든 본 경로가 실패했을 때의 구조 호출. 이 호출의 목적은 품질이
+# 아니라 0점 회피다.
+RESCUE_CAP_S = float(os.environ.get("RESCUE_CAP_S", "30"))
 
 # 우리 스스로를 밀어내지 않도록 상류 호출을 조인다. 요청 하나가 FM 을 최대 9회,
 # MCP 를 6회까지 부르기 때문에 동시 요청이 몰리면 상류가 먼저 무너진다.
@@ -134,12 +159,20 @@ RETRY_STATUS = {429, 500, 502, 503, 504}
 
 
 async def call_fm(
-    messages: list[dict], max_tokens: int, extra: dict[str, Any] | None = None
+    messages: list[dict],
+    max_tokens: int,
+    extra: dict[str, Any] | None = None,
+    timeout: float | None = None,
 ) -> dict[str, Any]:
     """FM 한 번 호출. `extra` 로 response_format 같은 vLLM 파라미터를 얹는다.
 
     일시적 실패(502·타임아웃 등)는 지수 백오프로 되돌려 시도한다.
     영구적 실패(400 output_limit_exceeded 등)는 즉시 올린다 — 재시도해도 같다.
+
+    `timeout` 은 **재시도와 백오프까지 포함한** 이 호출 전체의 상한이다.
+    주지 않으면 예전처럼 시도마다 FM_TIMEOUT 을 쓴다 — 그 경우 최악이
+    FM_TIMEOUT×FM_RETRIES 라 요청 예산을 통째로 넘긴다. 시간이 걸린 경로에서는
+    반드시 넘겨라. 상한을 소진하면 마지막 예외를, 예외가 없었으면 TimeoutError 를 올린다.
     """
     payload: dict[str, Any] = {
         "model": FM_MODEL,
@@ -150,14 +183,29 @@ async def call_fm(
         **(extra or {}),
     }
     assert _client is not None, "lifespan 이 클라이언트를 만들기 전에 호출됐다"
+    # timeout 을 안 주면 예전과 같은 최악(시도마다 TIMEOUT)을 그대로 쓴다.
+    total = timeout if (timeout and timeout > 0) else TIMEOUT * FM_RETRIES
+    started = time.monotonic()
+
+    def _left() -> float:
+        return total - (time.monotonic() - started)
+
     last: Exception | None = None
     for attempt in range(FM_RETRIES):
+        if _left() <= 0:
+            log.warning("FM 시간 예산 소진 — %d/%d 시도에서 중단", attempt + 1, FM_RETRIES)
+            break
         try:
             async with _fm_sem:
+                # 세마포어 대기도 예산을 먹는다. 잡고 나서 다시 재어야 정확하다.
+                left = _left()
+                if left <= 0:
+                    break
                 r = await _client.post(
                     f"{FM_URL}/v1/chat/completions",
                     headers={"Authorization": f"Bearer {FM_KEY}"},
                     json=payload,
+                    timeout=min(TIMEOUT, left),
                 )
             if r.status_code == 200:
                 return r.json()
@@ -173,10 +221,39 @@ async def call_fm(
             last = e
 
         if attempt < FM_RETRIES - 1:
-            await asyncio.sleep(FM_BACKOFF * (2**attempt))
+            backoff = FM_BACKOFF * (2**attempt)
+            # 백오프를 기다리고 나면 부를 시간이 없다면, 기다리는 것 자체가 손해다.
+            if _left() <= backoff + MIN_CALL_S:
+                log.warning("FM 재시도 포기 — 남은 예산 %.1fs", _left())
+                break
+            await asyncio.sleep(backoff)
 
-    assert last is not None
+    if last is None:
+        raise TimeoutError(f"FM 호출이 시간 예산 {total:.0f}s 안에 시작되지 못했다")
     raise last
+
+
+def _timed(call, timeout: float | None):
+    """call_fm 을 timeout 에 묶어서 돌려준다.
+
+    router.classify 처럼 call_fm 의 시그니처를 모르는 하위 모듈에 시간 예산을
+    주입하는 유일한 방법이다. 하위 모듈은 자기가 시간에 묶였다는 걸 모른 채 돈다.
+    """
+    if timeout is None:
+        return call
+
+    async def _call(messages, max_tokens, extra=None, **kw):
+        kw.setdefault("timeout", timeout)
+        return await call(messages, max_tokens, extra, **kw)
+
+    return _call
+
+
+async def _direct_answer(messages: list[dict], dl: Deadline) -> str:
+    """라우팅도 검색도 없이 답만 받는다. 시간이 없을 때의 마지막 경로다."""
+    t = answer_timeout(dl, ANSWER_CAP_S, ANSWER_FLOOR_S) if DEADLINE_GUARD else None
+    data = await call_fm(_with_answer_instruction(messages), MAX_TOKENS, timeout=t)
+    return (data["choices"][0]["message"].get("content") or "").strip()
 
 
 def _last_user_text(messages: list[dict]) -> str:
@@ -200,7 +277,17 @@ def _with_answer_instruction(messages: list[dict]) -> list[dict]:
 
 async def generate_reply(messages: list[dict], dl: Deadline) -> str:
     """라우팅 → MCP 근거 검색 → 생성 → 출력 검증 순으로 다음 발화를 만든다."""
-    route = await classify(messages, call_fm)
+    # 분류부터 시간에 묶는다. 여기서 늦어지면 검색·답변·검증이 전부 밀린다.
+    keep = ANSWER_RESERVE_S + VERIFY_RESERVE_S
+    if DEADLINE_GUARD and dl.expired(reserve=keep):
+        # 답 쓸 시간만 남았다. 라우팅을 포기하고 답을 낸다 — 빈 답이 가장 나쁘다.
+        log.info("분류 생략 — 남은 %.1fs 로 직답", dl.remaining())
+        return await _direct_answer(messages, dl)
+
+    route = await classify(
+        messages,
+        _timed(call_fm, call_cap(dl, CLASSIFY_CAP_S, reserve=keep) if DEADLINE_GUARD else None),
+    )
     log.info(
         "route: domain=%s urgency=%s persona=%s lang=%s date=%s src=%s tools=%d",
         route.domain, route.urgency, route.persona, route.lang,
@@ -218,8 +305,10 @@ async def generate_reply(messages: list[dict], dl: Deadline) -> str:
         MCP,
         MAX_TOKENS,
         budget,
-        deadline=dl,
-        reserve=ANSWER_RESERVE_S + VERIFY_RESERVE_S,
+        deadline=dl if DEADLINE_GUARD else None,
+        reserve=keep,
+        answer_cap=ANSWER_CAP_S,
+        answer_floor=ANSWER_FLOOR_S,
     )
     if not content:
         log.error("generation 이 빈 content 를 냈다 — elapsed=%.1fs", dl.elapsed)
@@ -230,7 +319,7 @@ async def generate_reply(messages: list[dict], dl: Deadline) -> str:
         _last_user_text(messages),
         retr.as_prompt() if retr else "",
         len(retr.items) if retr else 0,
-        call_fm,
+        _timed(call_fm, call_cap(dl, FM_CALL_CAP_S) if DEADLINE_GUARD else None),
         MAX_TOKENS,
         lang=route.lang,
         deadline=dl,
@@ -252,21 +341,22 @@ async def chat_completions(body: dict) -> dict[str, Any]:
         content = await asyncio.wait_for(
             generate_reply(messages, dl), timeout=REQUEST_BUDGET_S + 20
         )
-    except asyncio.TimeoutError:
-        # 여기서 빈 문자열을 흘리면 그 문항은 0점이다. 도구도 라우팅도 없이
-        # 한 번만 더, 짧게 답을 받아 본다. 늦은 답이 없는 답보다 낫다.
-        log.error("요청 시간 초과 — 직답으로 되살린다 (elapsed=%.1fs)", dl.elapsed)
+    except Exception as e:  # noqa: BLE001
+        # 실패 종류로 갈라서는 안 된다. 예전에는 asyncio.TimeoutError 만 되살리고
+        # 나머지는 빈 문자열로 내려보냈는데, httpx.ReadTimeout 은 TimeoutError 가
+        # 아니라서 그 문이 닫혀 있었다 — 실측에서 6/30 이 이 문으로 빠졌다.
+        # 어떤 이유로 실패했든 답은 내야 한다. 빈 답은 확정 0점이다.
+        log.warning("본 경로 실패(%s) — 직답으로 되살린다 (elapsed=%.1fs)",
+                    type(e).__name__, dl.elapsed)
         try:
-            data = await asyncio.wait_for(call_fm(messages, MAX_TOKENS), timeout=60)
-            content = (data["choices"][0]["message"].get("content") or "").strip()
+            content = await asyncio.wait_for(
+                _direct_answer(messages, dl), timeout=RESCUE_CAP_S + 10
+            )
         except Exception:
+            # 평가 하네스에 5xx 를 돌려주면 대화 전체가 깨질 수 있다.
+            # 그래서 형식은 지키되, 실패는 로그에 남겨 사후에 반드시 보이게 한다.
             log.exception("직답 폴백도 실패")
             content = ""
-    except Exception:
-        # 평가 하네스에 5xx 를 돌려주면 대화 전체가 깨질 수 있다.
-        # 그래서 형식은 지키되, 실패는 로그에 남겨 사후에 반드시 보이게 한다.
-        log.exception("생성 실패")
-        content = ""
 
     log.info("응답 %d자 / %.1fs", len(content), dl.elapsed)
     return {

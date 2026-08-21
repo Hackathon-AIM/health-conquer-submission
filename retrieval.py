@@ -20,10 +20,49 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
+from budget import call_cap
+
 log = logging.getLogger("retrieval")
+
+# ── 도구별 시간 상한 ──────────────────────────────────────────
+# 21종을 같은 상한으로 다루면 안 된다. 코드 조회는 1초 안에 오고, 페이지 원문·SQL·
+# 벡터 검색은 십수 초가 걸린다. 느린 쪽에 맞춰 상한을 잡으면 빠른 도구가 죽을 때
+# 그 대기가 예산을 다 먹고, 빠른 쪽에 맞추면 느린 도구는 항상 실패한다.
+FAST_TOOLS = {
+    "kcd_get_name",
+    "kcd_search_codes",
+    "openapi_hira_disease_check_code",
+    "openapi_hira_get_drug_price",
+    "openapi_mfds_check_drug_permission",
+    "openapi_mfds_find_drugs_by_ingredient",
+    "openapi_law_search",
+    "openapi_law_list_articles",
+    "openapi_law_get_article",
+    "rag_get_all_data_sources",
+    "rag_get_data_source_detail",
+    "index_list_documents",
+}
+MCP_FAST_CAP_S = float(os.environ.get("MCP_FAST_CAP_S", "8"))
+MCP_SLOW_CAP_S = float(os.environ.get("MCP_SLOW_CAP_S", "18"))
+
+# retrieval 단계의 FM 왕복 하나에 걸 상한.
+RETRIEVAL_STEP_CAP_S = float(os.environ.get("RETRIEVAL_STEP_CAP_S", "20"))
+
+# 도구 결과를 대화에 얹을 때의 길이. 이게 크면 다음 스텝의 프롬프트가 그만큼
+# 부풀고, 부푼 프롬프트는 그대로 지연이 된다 — 3스텝이면 앞 두 스텝의 결과를
+# 통째로 다시 보내는 셈이다.
+TOOL_RESULT_CHARS = int(os.environ.get("TOOL_RESULT_CHARS", "12000"))
+
+# FM 왕복 상한. 도구 호출 예산과 별개로, 모델이 도구를 안 부르고 맴돌 때를 끊는다.
+RETRIEVAL_MAX_STEPS = int(os.environ.get("RETRIEVAL_MAX_STEPS", "4"))
+
+
+def tool_cap(name: str) -> float:
+    return MCP_FAST_CAP_S if name in FAST_TOOLS else MCP_SLOW_CAP_S
 
 # 도구 설명 전문을 다 넣으면 프롬프트가 부푼다. 앞부분에 사용 조건이 다 적혀 있다.
 DESC_LIMIT = 900
@@ -228,7 +267,10 @@ async def run_retrieval(
         return res
 
     try:
-        mcp_tools = await mcp.list_tools()
+        # 도구 목록도 시간에 묶는다. 여기서 막히면 검색을 시작도 못 하고 예산만 탄다.
+        mcp_tools = await mcp.list_tools(
+            timeout=call_cap(deadline, MCP_FAST_CAP_S, reserve=reserve)
+        )
     except Exception as e:  # noqa: BLE001 — 검색이 죽어도 답변은 해야 한다
         log.warning("MCP 도구 목록 실패: %s", e)
         res.note = "retrieval unavailable"
@@ -244,13 +286,24 @@ async def run_retrieval(
     ]
     harvested: dict[str, Evidence] = {}
 
-    for _ in range(budget):
+    # budget 은 **실제 MCP 도구 호출 수**다. 예전에는 이 값이 FM 왕복 수였고,
+    # 모델이 한 스텝에 도구를 3개 부르면 예산 3에 9번이 나갔다. 이름과 주석은
+    # "도구 호출 수" 라고 말하고 있었으므로 이쪽이 원래 의도다.
+    steps_left = max(1, RETRIEVAL_MAX_STEPS)
+
+    while res.tool_calls_used < budget and steps_left > 0:
+        steps_left -= 1
         if deadline is not None and deadline.expired(reserve=reserve):
             log.info("시간 예산으로 retrieval 조기 종료 (남은 %.0fs)", deadline.remaining())
             res.note = (res.note + " " if res.note else "") + "retrieval cut short by time budget"
             break
         try:
-            data = await call_fm(messages, step_tokens, {"tools": tools})
+            data = await call_fm(
+                messages,
+                step_tokens,
+                {"tools": tools},
+                timeout=call_cap(deadline, RETRIEVAL_STEP_CAP_S, reserve=reserve),
+            )
         except Exception as e:  # noqa: BLE001
             log.warning("retrieval 스텝 실패: %s", e)
             break
@@ -287,10 +340,29 @@ async def run_retrieval(
                 finalized = True
                 break
 
+            # 한 스텝에 도구를 여러 개 부를 수 있다. 예산이나 시간을 이미 썼으면
+            # 실제로는 부르지 않는다 — 다만 tool 응답 자체는 반드시 채워 넣는다.
+            # tool_call 하나에 짝이 되는 tool 메시지가 없으면 다음 스텝 요청이 400 이다.
+            out_of_budget = res.tool_calls_used >= budget
+            out_of_time = deadline is not None and deadline.expired(reserve=reserve)
+            if out_of_budget or out_of_time:
+                why = "tool budget exhausted" if out_of_budget else "time budget exhausted"
+                res.trace.append(f"{fn}(skipped: {why})")
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc.get("id") or "",
+                        "content": json.dumps({"error": f"skipped: {why}"}, ensure_ascii=False),
+                    }
+                )
+                continue
+
             res.tool_calls_used += 1
             res.trace.append(f"{fn}({json.dumps(args, ensure_ascii=False)[:120]})")
             try:
-                payload = await mcp.call_tool(fn, args)
+                payload = await mcp.call_tool(
+                    fn, args, timeout=call_cap(deadline, tool_cap(fn), reserve=reserve)
+                )
                 _harvest(payload, harvested)
                 content = json.dumps(payload, ensure_ascii=False)
             except Exception as e:  # noqa: BLE001 — 한 도구가 죽어도 계속 간다
@@ -298,7 +370,11 @@ async def run_retrieval(
                 content = json.dumps({"error": str(e)[:300]}, ensure_ascii=False)
 
             messages.append(
-                {"role": "tool", "tool_call_id": tc.get("id") or "", "content": content[:12000]}
+                {
+                    "role": "tool",
+                    "tool_call_id": tc.get("id") or "",
+                    "content": content[:TOOL_RESULT_CHARS],
+                }
             )
 
         if finalized:
