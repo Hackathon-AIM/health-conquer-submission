@@ -133,6 +133,14 @@ class LLM:
             "temperature": lc.get("temperature", 0.2) if temperature is None else temperature,
             "max_tokens": lc.get("max_tokens", 1200) if max_tokens is None else max_tokens,
         }
+        # ★ L2 는 사고과정을 별도 `reasoning` 필드로 뱉는데, 그게 max_tokens 예산을
+        #   통째로 먹는다. 서버 상한이 2048 이라 켜두면 긴 답변이 구조적으로 잘린다.
+        #   팀 실측(같은 질문):
+        #     thinking on  → reasoning 2492자 + content 881자, finish=length (잘림)
+        #     thinking off → reasoning    0자 + content 576자, finish=stop   (완결)
+        #   <think> 태그를 벗기는 strip_think 로는 못 막는다 — 필드가 다르다.
+        if not lc.get("enable_thinking", False):
+            kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
         if json_mode:
             # 지원하지 않는 엔드포인트면 아래 except에서 무시하고 재시도
             kwargs["response_format"] = {"type": "json_object"}

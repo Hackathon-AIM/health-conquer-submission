@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -103,15 +104,36 @@ def static_checks() -> None:
         "브랜치가 lunit/hackathon-submission",
         f"현재: {br} — 제출 전 이 브랜치로 머지해야 한다", fatal=False)
     dirty = sh("git", "status", "--porcelain")
-    chk(not dirty, "커밋 안 된 변경 없음",
-        f"{len(dirty.splitlines())}개 파일" if dirty else "", fatal=False)
+    if dirty:
+        chk(False, "★ 커밋 안 된 변경이 있다",
+            f"{len(dirty.splitlines())}개 파일 — 이 변경은 제출에 포함되지 않는다")
+        for line in dirty.splitlines()[:10]:
+            print(f"      {line}")
+        print("      → git add -A && git commit -m '...' && git push")
+    else:
+        chk(True, "커밋 안 된 변경 없음")
+
+    unpushed = sh("git", "log", "--oneline", "@{u}..HEAD")
+    if unpushed:
+        chk(False, "★ 푸시 안 된 커밋이 있다",
+            f"{len(unpushed.splitlines())}개 — git push 필요")
+
     sha = sh("git", "rev-parse", "HEAD")
     if sha:
         print(f"\n   제출할 40자리 SHA: {sha}")
+        if dirty or unpushed:
+            print("   ⚠️  위 경고를 해결하기 전에는 이 SHA 를 제출하지 마세요.")
 
 
 def docker_checks() -> None:
     print("\n[도커 빌드]")
+    if not shutil.which("docker"):
+        chk(False, "docker 명령이 없다",
+            "미설치 — 컨테이너 검증 불가", fatal=False)
+        print("      설치: brew install --cask docker  (또는 docker.com/products/docker-desktop)")
+        print("      ⚠️ 설치 전까지 '빌드 5분 이내'와 '수동 작업 없이 기동'은")
+        print("         검증되지 않은 상태입니다. 팀원 중 docker 있는 사람에게 부탁해도 됩니다.")
+        return
     t0 = time.perf_counter()
     r = subprocess.run(["docker", "build", "-t", "medai-submit:check", "."],
                        cwd=ROOT, capture_output=True, text=True)

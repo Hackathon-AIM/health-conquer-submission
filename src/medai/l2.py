@@ -273,12 +273,17 @@ class L2Harness:
     # ── 저수준: tool 지원 chat 호출 (llm.chat 은 tools 를 모른다) ──
     async def _chat_tools(self, messages: list[dict], tools: list[dict],
                           tool_choice: str = "auto"):
+        lc = self.cfg["llm"]
         kwargs: dict[str, Any] = {
             "model": self.llm.models.get("drafter", "Lunit/L2-preview"),
             "messages": messages,
-            "temperature": self.cfg["llm"].get("temperature", 0.2),
-            "max_tokens": self.cfg["llm"].get("max_tokens", 2048),
+            "temperature": lc.get("temperature", 0.2),
+            # 서버 상한 2048. 넘기면 400 output_limit_exceeded (팀 실측).
+            "max_tokens": min(int(lc.get("max_tokens", 2048)), 2048),
         }
+        # reasoning 필드가 2048 예산을 먹어 답변이 잘리는 것을 막는다 (llm.py 주석 참조)
+        if not lc.get("enable_thinking", False):
+            kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
         if tools:   # 빈 tools 배열은 일부 서버에서 400 — 아예 빼는 게 안전
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice
