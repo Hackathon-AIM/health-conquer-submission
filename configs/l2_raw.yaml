@@ -1,0 +1,29 @@
+# ★ 넘어야 할 기준선 — L2 권장 2단계 사용법 그대로, 우리 레이어 없이.
+#
+# passthrough + l2_native = 질의 재작성(멀티턴 필수) 외에는 아무것도 안 한다.
+# make ab-baseline 이 이 설정과 l2_live 를 같은 문항으로 비교한다.
+# 우리 파이프라인이 이 점수를 못 넘으면 레이어가 노이즈를 넣고 있는 것이다.
+name: l2_raw
+
+llm:
+  base_url: "https://model.hackathon.lunit.io/v1"
+  api_key_env: "LUNIT_FM_API_KEY"
+  timeout: 90.0
+  temperature: 0.2
+  max_tokens: 2048
+
+models:
+  classifier: "Lunit/L2-preview"
+  rewriter:   "Lunit/L2-preview"
+  drafter:    "Lunit/L2-preview"
+  critic:     "Lunit/L2-preview"
+  extractor:  "Lunit/L2-preview"
+  grader:     "Lunit/L2-preview"
+
+layers:
+  passthrough: true
+  l2_native: true
+
+l2:
+  max_tool_calls: 8
+  max_retrievals_per_turn: 2

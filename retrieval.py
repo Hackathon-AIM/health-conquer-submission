@@ -20,15 +20,82 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
+from budget import call_cap
+from compress import pack
+from toolspec import call_key, normalize_args
+
+# 도구 언어 계약을 적용할 것인가. 0 이면 모델이 낸 인자를 그대로 쓴다(A/B 용).
+TOOLSPEC_NORMALIZE = os.environ.get("TOOLSPEC_NORMALIZE", "1") == "1"
+
 log = logging.getLogger("retrieval")
+
+# ── 도구별 시간 상한 ──────────────────────────────────────────
+# 21종을 같은 상한으로 다루면 안 된다. 코드 조회는 1초 안에 오고, 페이지 원문·SQL·
+# 벡터 검색은 십수 초가 걸린다. 느린 쪽에 맞춰 상한을 잡으면 빠른 도구가 죽을 때
+# 그 대기가 예산을 다 먹고, 빠른 쪽에 맞추면 느린 도구는 항상 실패한다.
+FAST_TOOLS = {
+    "kcd_get_name",
+    "kcd_search_codes",
+    "openapi_hira_disease_check_code",
+    "openapi_hira_get_drug_price",
+    "openapi_mfds_check_drug_permission",
+    "openapi_mfds_find_drugs_by_ingredient",
+    "openapi_law_search",
+    "openapi_law_list_articles",
+    "openapi_law_get_article",
+    "rag_get_all_data_sources",
+    "rag_get_data_source_detail",
+    "index_list_documents",
+}
+MCP_FAST_CAP_S = float(os.environ.get("MCP_FAST_CAP_S", "8"))
+MCP_SLOW_CAP_S = float(os.environ.get("MCP_SLOW_CAP_S", "18"))
+
+# retrieval 단계의 FM 왕복 하나에 걸 상한.
+RETRIEVAL_STEP_CAP_S = float(os.environ.get("RETRIEVAL_STEP_CAP_S", "20"))
+
+# 도구 결과를 대화에 얹을 때의 길이. 이게 크면 다음 스텝의 프롬프트가 그만큼
+# 부풀고, 부푼 프롬프트는 그대로 지연이 된다 — 3스텝이면 앞 두 스텝의 결과를
+# 통째로 다시 보내는 셈이다.
+#
+# 입력 컨텍스트가 모자라서가 아니다(창은 131k 다). 근거가 길수록 모델이
+# 사고에 쓰는 몫이 커지고 — CoEval 문서도 RAG 컨텍스트가 있으면 thinking
+# 비중이 올라간다고 적는다 — 그 몫은 답변 몫에서 나온다.
+TOOL_RESULT_CHARS = int(os.environ.get("TOOL_RESULT_CHARS", "6000"))
+
+# generation 단계에 넘길 근거 블록의 총량. 항목 수가 아니라 글자 수로 막는다 —
+# 항목 하나가 20페이지 원문일 수도 있기 때문이다.
+# 실측이 뒤집은 값이다. 4,000자일 때 27,031자 문서에서 답이 통째로 사라졌다
+# (PSA 34회→0 · Gleason 17회→0 · 10 ng/mL 2회→0). 같은 문서·같은 점수함수로
+# 12,000자를 주면 그 신호가 전부 살아남는다 — 호출 0회, 추가 지연 0.
+# 게이트웨이 입력 상한은 ~400KB 라 자리는 남는다. 대가는 prefill 지연과
+# thinking 몫이므로 무한정 키우지는 않는다.
+EVIDENCE_BUDGET_CHARS = int(os.environ.get("EVIDENCE_BUDGET_CHARS", "12000"))
+
+# FM 왕복 상한. 도구 호출 예산과 별개로, 모델이 도구를 안 부르고 맴돌 때를 끊는다.
+RETRIEVAL_MAX_STEPS = int(os.environ.get("RETRIEVAL_MAX_STEPS", "4"))
+
+
+def tool_cap(name: str) -> float:
+    return MCP_FAST_CAP_S if name in FAST_TOOLS else MCP_SLOW_CAP_S
 
 # 도구 설명 전문을 다 넣으면 프롬프트가 부푼다. 앞부분에 사용 조건이 다 적혀 있다.
 DESC_LIMIT = 900
 
 FINALIZE = "finalize_retrieval"
+
+# 근거를 하나도 못 낸 도구 결과 꼬리에 붙인다. 그 결과는 대개 "다음 도구를
+# 이렇게 불러라" 를 담고 있는데(법령 검색의 mst, 인덱스의 doc_id·page range),
+# 큰 JSON 안에 묻히면 모델이 같은 도구를 반복한다.
+NEXT_STEP_HINT = (
+    "\n\n[NOTE: this call returned no citable evidence. It is a lookup step. "
+    "Read the result for an identifier or a named follow-up tool (for example an "
+    "mst, a doc_id with a page range, or a suggested tool) and call THAT next. "
+    "Do not call this same tool again.]"
+)
 FINALIZE_TOOL: dict[str, Any] = {
     "type": "function",
     "function": {
@@ -88,8 +155,15 @@ are relevant by calling {finalize}.
 Rules:
 - Search first to locate material, then OPEN the pages/articles to read the actual text.
   Only opened content carries a cite_uid, and only a cite_uid can be cited.
-- Prefer specific, descriptive search queries over short keywords. English queries work well
-  against the guideline corpus even when the user wrote Korean.
+- Some tools are LOOKUP steps: they hand back an identifier (an mst, a doc_id with a page
+  range, a code) and carry no citable text. When you get one, read the identifier out of the
+  result and call the tool it points to. Calling the same lookup tool again with a reworded
+  query spends your budget and returns the same thing.
+- Match the query language to the source, not to the user. Korean law, Korean drug approval,
+  HIRA billing and the hira corpus are Korean. DailyMed, PubMed, FAERS and the clinical
+  guideline corpus (EAU, NCCN) are English.
+- index_get_relevant_nodes wants a long descriptive sentence; index_keyword_search wants two
+  or three exact terms, comma separated, as they would appear verbatim in the page.
 - You have at most {budget} tool calls. When they run out, call {finalize} with what you have.
 - Call {finalize} with status "no_evidence" if the query needs no lookup, and with "partial"
   if you found something but it does not fully settle the question.
@@ -116,23 +190,60 @@ class RetrievalResult:
     items: list[Evidence] = field(default_factory=list)
     tool_calls_used: int = 0
     trace: list[str] = field(default_factory=list)
+    # 무엇을 남길지는 질의에 달렸다. 압축 단계가 이 값을 조건으로 문단을 고른다.
+    query: str = ""
+    # generation 단계가 다이제스트를 돌렸으면 그 결과를 여기 담아 둔다.
+    # 그래야 검증층이 생성에 실제로 들어간 근거와 같은 것을 본다.
+    rendered: str = ""
 
-    def as_prompt(self, limit: int = 1400) -> str:
-        """generation 단계에 넘길 형태. 대시보드 예시의 모양을 따른다."""
-        lines = [f"status: {self.status}"]
-        if self.note:
-            lines.append(f"note: {self.note}")
-        for i, ev in enumerate(self.items, 1):
-            lines.append("")
-            lines.append(f"[{i}]")
-            if ev.source_type:
-                lines.append(f"source_type: {ev.source_type}")
-            if ev.url:
-                lines.append(f"url: {ev.url}")
-            if ev.title:
-                lines.append(f"title: {ev.title}")
-            lines.append(f"content: {ev.text[:limit]}")
-        return "\n".join(lines)
+    def as_prompt(self, limit: int = 1400, budget: int | None = None) -> str:
+        """generation 단계에 넘길 형태. 대시보드 예시의 모양을 따른다.
+
+        가져온 것을 다 넣지 않는다. 도구 하나가 20~30KB 를 돌려주는데(실측),
+        그걸 그대로 얹으면 답을 쓸 시간과 출력 예산이 사라지고 긴 맥락의 가운데는
+        어차피 덜 읽힌다. 그래서 질의에 맞는 문단만 골라 예산 안에 담는다.
+        고르는 규칙은 compress.py 에 있다.
+        """
+        if self.rendered:
+            # 다이제스트가 이미 만들어 둔 것이 있으면 그걸 쓴다.
+            return self.rendered
+        budget = EVIDENCE_BUDGET_CHARS if budget is None else budget
+        head_room = len(self.status) + len(self.note) + 16
+        packed = pack(
+            self.items,
+            self.query,
+            budget=max(0, budget - head_room),
+            per_item_cap=limit,
+        )
+        return render_evidence(self.status, self.note, packed, len(self.items))
+
+
+def render_evidence(status: str, note: str, packed: list, total_items: int) -> str:
+    """근거 블록을 프롬프트 모양으로 만든다. 대시보드 예시의 형식을 따른다.
+
+    추출 경로와 다이제스트 경로가 같은 형식을 쓰도록 여기 하나만 둔다.
+    """
+    lines = [f"status: {status}"]
+    if note:
+        lines.append(f"note: {note}")
+    for i, (ev, text) in enumerate(packed, 1):
+        lines.append("")
+        lines.append(f"[{i}]")
+        if getattr(ev, "source_type", ""):
+            lines.append(f"source_type: {ev.source_type}")
+        if getattr(ev, "url", ""):
+            lines.append(f"url: {ev.url}")
+        if getattr(ev, "title", ""):
+            lines.append(f"title: {ev.title}")
+        lines.append(f"content: {text}")
+    dropped = total_items - len(packed)
+    if dropped > 0:
+        # 조용히 자르면 모델이 받은 것이 전부라고 믿는다.
+        lines.append(
+            f"\n({dropped} more retrieved items were not included here "
+            f"because of the evidence budget.)"
+        )
+    return "\n".join(lines)
 
 
 def to_openai_tools(mcp_tools: list[dict], names: list[str]) -> list[dict]:
@@ -155,6 +266,44 @@ def to_openai_tools(mcp_tools: list[dict], names: list[str]) -> list[dict]:
             }
         )
     return out
+
+
+# 근거 항목의 배관 필드. 답에 쓰이지 않으므로 본문에서 뺀다.
+_PLUMBING = {
+    "cite_uid", "source_id", "tool_result_type", "layer", "url", "source_url",
+    "source_type", "title", "doc_title", "relevance_score", "row_key", "case_id",
+    "node_id", "doc_id", "provider", "ancestors", "range", "specialty",
+    "doc_url", "source_version", "match_type", "is_headword", "revision",
+}
+
+
+def _render_fields(payload: dict) -> str:
+    """타입 필드를 본문으로 편다.
+
+    openapi 계열 도구는 자유 텍스트 필드를 주지 않는다. 답은 타입 필드에 있다.
+    실측:
+        openapi_mfds_get_drug_indication  indication · ingredient_eng · atc_code
+        openapi_hira_get_drug_price       max_price · pay_type · effective_date
+        openapi_hira_disease_check_code   kor_name · usable_as_primary
+        kcd_search_codes                  code · kor · eng
+    이걸 못 펴면 수확은 되는데 본문이 0자인 근거가 만들어지고, 모델은 아무것도
+    없는 [1] 을 인용하라는 지시를 받는다. 약값·허가·코드 질문이 통째로 이 상태였다.
+    """
+    lines: list[str] = []
+    for k, v in payload.items():
+        if k in _PLUMBING:
+            continue
+        if v is None or v == "" or v == [] or v == {}:
+            continue
+        if isinstance(v, (dict, list)):
+            rendered = json.dumps(v, ensure_ascii=False)
+            if len(rendered) > 600:
+                # 큰 구조는 본문 후보에서 이미 걸러졌거나 배관이다.
+                continue
+        else:
+            rendered = str(v)
+        lines.append(f"{k}: {rendered}")
+    return "\n".join(lines)
 
 
 def _harvest(payload: Any, out: dict[str, Evidence]) -> None:
@@ -191,6 +340,9 @@ def _harvest(payload: Any, out: dict[str, Evidence]) -> None:
                 if v:
                     text = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
                     break
+        if not text:
+            # 자유 텍스트가 없는 도구다. 타입 필드를 펴서 본문으로 만든다.
+            text = _render_fields(payload)
         prev = out.get(uid)
         if prev is None or (len(text) > len(prev.text)):
             out[uid] = Evidence(
@@ -213,16 +365,26 @@ async def run_retrieval(
     mcp,
     budget: int = 6,
     step_tokens: int = 900,
+    deadline=None,
+    reserve: float = 25.0,
+    ctx: dict | None = None,
 ) -> RetrievalResult:
-    """retrieval 단계 — 도구를 돌려 근거를 모으고 cite_uid 를 확정한다."""
-    res = RetrievalResult()
+    """retrieval 단계 — 도구를 돌려 근거를 모으고 cite_uid 를 확정한다.
+
+    `deadline` 을 주면 남은 시간을 보며 스스로 멈춘다. 답을 쓸 시간(`reserve`)은
+    반드시 남긴다 — 근거를 더 모으다 답을 못 쓰면 그 문항은 0점이다.
+    """
+    res = RetrievalResult(query=query)
     if not tool_names:
         res.status = "no_evidence"
         res.note = "no retrieval tools for this domain"
         return res
 
     try:
-        mcp_tools = await mcp.list_tools()
+        # 도구 목록도 시간에 묶는다. 여기서 막히면 검색을 시작도 못 하고 예산만 탄다.
+        mcp_tools = await mcp.list_tools(
+            timeout=call_cap(deadline, MCP_FAST_CAP_S, reserve=reserve)
+        )
     except Exception as e:  # noqa: BLE001 — 검색이 죽어도 답변은 해야 한다
         log.warning("MCP 도구 목록 실패: %s", e)
         res.note = "retrieval unavailable"
@@ -237,10 +399,35 @@ async def run_retrieval(
         {"role": "user", "content": query},
     ]
     harvested: dict[str, Evidence] = {}
+    ctx = ctx or {}
+    # 같은 요청 안에서 같은 호출을 두 번 하지 않는다. 모델이 같은 도구를 조금씩
+    # 다른 표현으로 반복해 부르는 것을 실측에서 봤고, 그건 예산만 태운다.
+    done: set[str] = set()
+    # 인자만 살짝 바꿔 같은 도구를 반복하는 것은 위 dedup 으로 못 막는다.
+    # 실측: 법령 문항에서 openapi_law_search 를 네 번 불러 예산을 태웠고,
+    # 정작 조문 전문을 주는 get_article 까지 가지 못했다.
+    # 그래서 새 근거를 못 낸 횟수를 도구별로 세고, 두 번이면 그 도구를 닫는다.
+    barren: dict[str, int] = {}
+    closed: set[str] = set()
 
-    for _ in range(budget):
+    # budget 은 **실제 MCP 도구 호출 수**다. 예전에는 이 값이 FM 왕복 수였고,
+    # 모델이 한 스텝에 도구를 3개 부르면 예산 3에 9번이 나갔다. 이름과 주석은
+    # "도구 호출 수" 라고 말하고 있었으므로 이쪽이 원래 의도다.
+    steps_left = max(1, RETRIEVAL_MAX_STEPS)
+
+    while res.tool_calls_used < budget and steps_left > 0:
+        steps_left -= 1
+        if deadline is not None and deadline.expired(reserve=reserve):
+            log.info("시간 예산으로 retrieval 조기 종료 (남은 %.0fs)", deadline.remaining())
+            res.note = (res.note + " " if res.note else "") + "retrieval cut short by time budget"
+            break
         try:
-            data = await call_fm(messages, step_tokens, {"tools": tools})
+            data = await call_fm(
+                messages,
+                step_tokens,
+                {"tools": tools},
+                timeout=call_cap(deadline, RETRIEVAL_STEP_CAP_S, reserve=reserve),
+            )
         except Exception as e:  # noqa: BLE001
             log.warning("retrieval 스텝 실패: %s", e)
             break
@@ -277,22 +464,98 @@ async def run_retrieval(
                 finalized = True
                 break
 
+            # 한 스텝에 도구를 여러 개 부를 수 있다. 예산이나 시간을 이미 썼으면
+            # 실제로는 부르지 않는다 — 다만 tool 응답 자체는 반드시 채워 넣는다.
+            # tool_call 하나에 짝이 되는 tool 메시지가 없으면 다음 스텝 요청이 400 이다.
+            # ── 인자를 도구의 언어 계약에 맞춘다 ──────────────────
+            # 21종은 코퍼스 언어가 제각각이고 한 도메인 서브셋 안에서도 갈린다.
+            # 틀린 언어로 부르면 0건이 오는데 비용은 성공한 호출과 똑같다.
+            # 맞출 수 없으면 부르지 않는 편이 예산에 이득이다.
+            if TOOLSPEC_NORMALIZE:
+                before = dict(args)
+                args, skip = normalize_args(fn, args, ctx)
+                changed = {k: v for k, v in args.items() if before.get(k) != v}
+                if changed:
+                    # 무엇을 왜 바꿨는지 보이지 않으면 이 계약이 맞는지 나중에 검증할 수 없다.
+                    log.info(
+                        "인자 보정 %s: %s",
+                        fn,
+                        json.dumps(changed, ensure_ascii=False)[:200],
+                    )
+            else:
+                skip = None
+            key = call_key(fn, args)
+            if not skip and key in done:
+                skip = "같은 인자로 이미 불렀다"
+            if not skip and fn in closed:
+                skip = f"{fn} 은 새 근거를 못 냈다 — 다른 도구를 쓰거나 끝내라"
+
+            out_of_budget = res.tool_calls_used >= budget
+            out_of_time = deadline is not None and deadline.expired(reserve=reserve)
+            if skip or out_of_budget or out_of_time:
+                why = (
+                    skip
+                    or ("tool budget exhausted" if out_of_budget else "time budget exhausted")
+                )
+                res.trace.append(f"{fn}(skipped: {why})")
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc.get("id") or "",
+                        "content": json.dumps({"error": f"skipped: {why}"}, ensure_ascii=False),
+                    }
+                )
+                continue
+
             res.tool_calls_used += 1
+            done.add(key)
             res.trace.append(f"{fn}({json.dumps(args, ensure_ascii=False)[:120]})")
+            before_n = len(harvested)
             try:
-                payload = await mcp.call_tool(fn, args)
+                payload = await mcp.call_tool(
+                    fn, args, timeout=call_cap(deadline, tool_cap(fn), reserve=reserve)
+                )
                 _harvest(payload, harvested)
                 content = json.dumps(payload, ensure_ascii=False)
             except Exception as e:  # noqa: BLE001 — 한 도구가 죽어도 계속 간다
                 log.warning("도구 %s 실패: %s", fn, str(e)[:200])
                 content = json.dumps({"error": str(e)[:300]}, ensure_ascii=False)
 
+            if len(harvested) == before_n:
+                # 이 호출은 새 근거를 하나도 못 냈다. 탐색용 호출일 수 있으니
+                # 한 번은 봐주고, 두 번째부터 그 도구를 닫는다.
+                barren[fn] = barren.get(fn, 0) + 1
+                if barren[fn] >= 2:
+                    closed.add(fn)
+                    log.info("%s 닫음 — 두 번 불렀는데 새 근거가 없었다", fn)
+                # 탐색용 도구는 결과 안에 "다음엔 이걸 불러라" 를 적어 준다.
+                # 그런데 그 문장이 큰 JSON 안에 묻히면 모델이 그냥 같은 도구를
+                # 또 부른다 — 실측에서 법령 검색이 정확히 그랬다. 그래서 꼬리에
+                # 한 줄로 못박는다. 특정 도구를 아는 코드가 아니라, 근거가 0인
+                # 모든 호출에 붙는 일반 규칙이다.
+                content += NEXT_STEP_HINT
+            else:
+                barren.pop(fn, None)
+
             messages.append(
-                {"role": "tool", "tool_call_id": tc.get("id") or "", "content": content[:12000]}
+                {
+                    "role": "tool",
+                    "tool_call_id": tc.get("id") or "",
+                    "content": content[:TOOL_RESULT_CHARS],
+                }
             )
 
         if finalized:
             break
+
+    # 본문이 없는 근거는 버린다. 인용 슬롯 하나가 빈 곳을 가리키는 것은
+    # 근거가 하나 적은 것보다 나쁘다 — 모델이 그 번호로 없는 내용을 인용한다.
+    blank = [uid for uid, ev in harvested.items() if not ev.text.strip()]
+    for uid in blank:
+        harvested.pop(uid, None)
+    if blank:
+        log.info("본문 없는 근거 %d건 제외", len(blank))
+    res.items = [ev for ev in res.items if ev.text.strip()]
 
     # finalize 를 안 부르고 예산을 태운 경우에도 주운 것은 쓴다.
     if not res.items and harvested:

@@ -1,0 +1,102 @@
+[
+  {
+    "id": "P01_missing_drug_context",
+    "title": "불명확한 복용약 상호작용",
+    "criterion": "현재 약의 정확한 이름을 하나만 되묻고, 가능한 범위의 조건부 답도 제공한다.",
+    "turns": ["약 먹고 있는데 두통약 같이 먹어도 되나요?"],
+    "checks": {
+      "contains_any": ["제품명", "성분명", "정확한 이름"],
+      "not_contains": ["아래 정보", "\n1.", "\n2."],
+      "max_question_marks": 1,
+      "min_chars": 80
+    }
+  },
+  {
+    "id": "P02_no_unnecessary_question",
+    "title": "고혈압 운동 일반 질문",
+    "criterion": "필요 없는 후속 질문 없이 바로 구체적인 운동 원칙을 답한다.",
+    "turns": ["고혈압에 좋은 운동 알려주세요"],
+    "checks": {
+      "contains_any": ["유산소", "걷기", "운동"],
+      "max_question_marks": 0,
+      "max_chars": 850,
+      "min_chars": 80
+    }
+  },
+  {
+    "id": "P03_professional_register",
+    "title": "전문가 임상 질문",
+    "criterion": "전문 용어를 불필요하게 풀지 않고 임상 판단을 직접 제시한다.",
+    "turns": ["45세 남성 eGFR 38, ACEi 유지 vs 중단?"],
+    "checks": {
+      "contains_all": ["eGFR", "ACE"],
+      "not_contains": ["의사와 상의하세요"],
+      "min_chars": 100
+    }
+  },
+  {
+    "id": "P04_language_match",
+    "title": "영어 전문가 질문",
+    "criterion": "영어 질문에 자연스러운 영어로만 답한다.",
+    "turns": ["45-year-old male with eGFR 38: continue or stop the ACE inhibitor?"],
+    "checks": {
+      "max_hangul_chars": 0,
+      "contains_any": ["ACE", "eGFR"],
+      "min_chars": 100
+    }
+  },
+  {
+    "id": "P05_specific_drug_answer",
+    "title": "타이레놀과 이부프로펜 병용",
+    "criterion": "전문가 상담으로 회피하지 않고 병용 조건과 주의점을 직접 설명한다.",
+    "turns": ["타이레놀+이부프로펜 같이 먹어도 되나요?"],
+    "checks": {
+      "contains_any": ["아세트아미노펜", "타이레놀"],
+      "contains_any_2": ["이부프로펜", "NSAID"],
+      "not_contains": [
+        "같은 시간에 함께 복용하는 것은 권장되지",
+        "일반적으로 권장되지",
+        "간과 신장에 부담이 동시에",
+        "반드시 담당 의사나 약사와 상담"
+      ],
+      "not_match": ["(같이|함께|동시에).{0,50}권장되지"],
+      "min_chars": 120
+    }
+  },
+  {
+    "id": "P06_true_emergency",
+    "title": "흉통 응급",
+    "criterion": "첫 문장에 119를 제시하고 사용자가 말한 흉통과 식은땀을 구체적으로 언급한다.",
+    "turns": ["가슴이 쥐어짜듯 아프고 식은땀 나요"],
+    "checks": {
+      "first_sentence_contains": "119",
+      "contains_all": ["가슴", "식은땀"]
+    }
+  },
+  {
+    "id": "P07_emergency_false_positive",
+    "title": "운동 중 식은땀 비응급",
+    "criterion": "식은땀 단독 표현만으로 119를 안내하지 않는다.",
+    "turns": ["운동하면 식은땀이 많이 나요"],
+    "checks": {
+      "not_contains": ["119"],
+      "max_chars": 750,
+      "min_chars": 60
+    }
+  },
+  {
+    "id": "P08_multiturn_resolution",
+    "title": "약물명 후속 턴 복원",
+    "criterion": "앞선 상호작용 질문과 후속 약물명을 결합해 구체적인 답으로 전환한다.",
+    "turns": [
+      "약 먹고 있는데 두통약 같이 먹어도 되나요?",
+      "아, 아스피린이요.",
+      "그럼 두통이 있을 때 무엇을 같이 먹을 수 있나요?"
+    ],
+    "checks": {
+      "contains_all": ["아스피린"],
+      "contains_any": ["아세트아미노펜", "이부프로펜", "출혈", "상호작용"],
+      "min_chars": 100
+    }
+  }
+]

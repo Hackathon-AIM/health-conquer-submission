@@ -1,7 +1,33 @@
+# ── 비밀정보 (절대) ─────────────────────────────────────────
 .env
-.env.*
-!.env.example
+*.key
+*.pem
+
+# ── 남의 저장소 · 가상환경 ──────────────────────────────────
+# CoEval 은 루닛 저장소를 clone 한 것이다. 우리 제출물이 아니다.
+# ("embedded git repository" 경고의 원인)
+CoEval/
+.venv/
+venv/
+
+# ── 생성물 · 작업 흔적 ──────────────────────────────────────
 __pycache__/
 *.pyc
-.venv/
+*.pyo
+.pytest_cache/
+logs/
+_to_delete/
+_incoming/
+evaluation_outputs/
+
+# ── 실측 기록 (커밋해도 무해하나 제출물에는 불필요) ─────────
+data/probe/
+
+# ── 데이터 ─────────────────────────────────────────────────
+data/*.csv
+data/risk_screen.json
+# ⚠️ HealthBench 예시는 온라인 공개 금지 (OpenAI 요청 · 학습오염 방지)
+eval/datasets/*.jsonl
+
+# ── macOS ──────────────────────────────────────────────────
 .DS_Store

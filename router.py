@@ -24,6 +24,8 @@ from typing import Any
 
 log = logging.getLogger("router")
 
+_HANGUL_RE = re.compile(r"[가-힣]")
+
 # ── 도메인 → MCP 도구 서브셋 ──────────────────────────────────────────
 # 21개를 통째로 주면 모델이 헤맨다. 질문 유형별로 줄여서 준다.
 # 인접 도메인끼리 도구를 일부러 겹쳐 둔다. 실측에서 오분류가 남는 자리가
@@ -71,6 +73,23 @@ DOMAIN_TOOLS: dict[str, list[str]] = {
     "generic": [],
 }
 DOMAINS = list(DOMAIN_TOOLS)
+
+# ── 도메인별 최소 도구 호출 수 ────────────────────────────────
+#
+# 어떤 도메인은 한 번으로 끝나고 어떤 도메인은 체인이다. 법령이 대표적이다:
+#   openapi_law_search        법령명 → MST            (근거 아님)
+#   openapi_law_list_articles MST → 조문키            (근거 아님)
+#   openapi_law_get_article   조문키 → 조문 전문      (여기부터 근거다)
+# 근거 하나를 얻는 데 3홉이 든다. 예산 3 이면 한 번만 헛돌아도 답이 없다.
+#
+# 실측: 법령 문항에서 모델이 law_search 를 네 번 부르다 예산을 태웠고,
+# 답변은 근거 없이 기억에서 나온 38자였다.
+# guideline/hira 인덱스도 2홉이다 (relevant_nodes → get_page_content).
+DOMAIN_MIN_HOPS: dict[str, int] = {
+    "korean_law": 4,
+    "guideline_index": 3,
+    "hira_updates": 3,
+}
 
 # ── 응급 규칙 (recall 우선) ────────────────────────────────────────────
 # 단독으로 응급인 것.
@@ -131,8 +150,18 @@ ROUTE_SCHEMA: dict[str, Any] = {
         "persona": {"type": "string", "enum": ["layperson", "practitioner", "clinician"]},
         "lang": {"type": "string", "enum": ["ko", "en"]},
         "date_sensitive": {"type": "boolean"},
+        "query_ko": {"type": "string"},
+        "query_en": {"type": "string"},
+        "keywords_ko": {"type": "string"},
+        "keywords_en": {"type": "string"},
+        "drug_ko": {"type": "string"},
+        "drug_en": {"type": "string"},
     },
-    "required": ["domain", "urgency", "context", "ask_back", "persona", "lang", "date_sensitive"],
+    "required": [
+        "domain", "urgency", "context", "ask_back",
+        "persona", "lang", "date_sensitive",
+        "query_ko", "query_en", "keywords_ko", "keywords_en", "drug_ko", "drug_en",
+    ],
     "additionalProperties": False,
 }
 
@@ -151,11 +180,44 @@ class Route:
     lang: str = "ko"
     ask_back: str = ""  # context=missing_critical 일 때 되물을 문장 하나
     date_sensitive: bool = False  # 날짜가 박힌 질문이면 effective_date 대조가 필요하다
+    # 멀티턴 지시대명사를 푼 self-contained 검색 질의. 라우터가 여기서 만들어 두면
+    # generation 단계에서 "모델에게 도구를 줘서 질의를 받아오는" 왕복 한 번이 통째로 없어진다.
+    search_query: str = ""
+
+    # ── 도구 언어별 질의 변형 ────────────────────────────────
+    # MCP 21종은 코퍼스 언어가 제각각이다. 한 도메인 서브셋 안에서도 갈린다 —
+    # domain="adr" 에는 영문 DailyMed(adr_retrieve_drug_info)와 한글 식약처
+    # (openapi_mfds_get_drug_indication)가 같이 들어 있다. 질의가 하나뿐이면
+    # 둘 중 하나는 반드시 틀린 언어로 나가고, 틀린 언어는 0건인데 비용은 같다.
+    #
+    # 그래서 분류 **한 번**에서 두 벌을 같이 받는다. 추가 FM 호출은 없다.
+    query_ko: str = ""
+    query_en: str = ""
+    # index_keyword_search 는 원문 정확 일치라 문장이 아니라 키워드가 필요하다.
+    keywords_ko: str = ""
+    keywords_en: str = ""
+    # 약 이름은 한글 제품명(식약처·HIRA)과 영문 brand/INN(DailyMed)이 다른 자리다.
+    drug_ko: str = ""
+    drug_en: str = ""
+
     tools: list[str] = field(default_factory=list)
+    # 이 도메인이 근거 하나를 얻는 데 필요한 최소 도구 호출 수.
+    min_hops: int = 0
     source: str = "llm"  # llm | rules | fallback
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+    def search_ctx(self) -> dict[str, str]:
+        """toolspec.normalize_args 가 인자를 맞출 때 쓰는 재료."""
+        return {
+            "query_ko": self.query_ko,
+            "query_en": self.query_en,
+            "keywords_ko": self.keywords_ko,
+            "keywords_en": self.keywords_en,
+            "drug_ko": self.drug_ko,
+            "drug_en": self.drug_en,
+        }
 
 
 CLASSIFY_PROMPT = """You classify a Korean health question so a downstream system can route it.
@@ -210,7 +272,25 @@ Return ONLY a JSON object, no prose, with these keys:
 "date_sensitive": true if the question is pinned to a specific date or asks whether a rule is
   still current.
 
-Question:
+The next six keys are the SEARCH TERMS. The tools behind each domain do not share one
+language: Korean law, Korean drug approval, HIRA billing and hira_faq are Korean corpora,
+while DailyMed, PubMed, FAERS and the clinical guideline corpus (EAU, NCCN) are English.
+A query in the wrong language returns nothing and still costs a tool call, so write both.
+First resolve every pronoun and ellipsis from the conversation ("그 약" -> the actual drug).
+
+"query_ko": the self-contained question in Korean, descriptive rather than a few keywords.
+"query_en": the same question in English. Translate, do not transliterate. Use the terms a
+  clinical guideline would use ("active surveillance for low-risk prostate cancer").
+"keywords_ko": 2-3 Korean noun phrases that would appear VERBATIM in a Korean document,
+  comma separated. No particles, no verb endings — these are matched exactly.
+"keywords_en": the same, in English, comma separated.
+"drug_ko": if a drug is named, its Korean product name as sold in Korea ("타이레놀"). Else "".
+"drug_en": that drug's English brand or INN name ("acetaminophen", "Tylenol"). Else "".
+  Both drug keys must be "" when the question names no drug.
+
+Leave all six as "" only when domain is "generic".
+
+Conversation (most recent user turn last):
 {question}"""
 
 
@@ -233,6 +313,16 @@ def last_user_text(messages: list[dict]) -> str:
     return ""
 
 
+def transcript(messages: list[dict], turns: int = 5, per_turn: int = 700) -> str:
+    """최근 대화를 라우터에 보여줄 형태로. 지시대명사를 풀려면 앞 턴이 필요하다."""
+    tail = [m for m in messages if m.get("role") in ("user", "assistant")][-turns:]
+    lines = []
+    for m in tail:
+        who = "User" if m.get("role") == "user" else "Assistant"
+        lines.append(f"{who}: {str(m.get('content') or '')[:per_turn]}")
+    return "\n".join(lines)
+
+
 def build_route(raw: dict[str, Any] | None, question: str, source: str) -> Route:
     raw = raw or {}
     r = Route(source=source)
@@ -251,6 +341,29 @@ def build_route(raw: dict[str, Any] | None, question: str, source: str) -> Route
 
     r.lang = "en" if str(raw.get("lang") or "").strip() == "en" else "ko"
     r.ask_back = str(raw.get("ask_back") or "").strip()
+    # 라우터가 질의를 못 만들었으면 마지막 사용자 발화를 그대로 쓴다. 지시대명사가
+    # 남아 있을 수 있지만, 검색을 통째로 건너뛰는 것보다는 낫다.
+    r.query_ko = str(raw.get("query_ko") or "").strip()
+    r.query_en = str(raw.get("query_en") or "").strip()
+    r.keywords_ko = str(raw.get("keywords_ko") or "").strip()
+    r.keywords_en = str(raw.get("keywords_en") or "").strip()
+    r.drug_ko = str(raw.get("drug_ko") or "").strip()
+    r.drug_en = str(raw.get("drug_en") or "").strip()
+
+    # 질문 언어 쪽은 최소한 채워 둔다 — 비어 있으면 검색이 통째로 날아간다.
+    if not r.query_ko and _HANGUL_RE.search(question):
+        r.query_ko = question
+    if not r.query_en and not _HANGUL_RE.search(question):
+        r.query_en = question
+
+    # 예전 필드는 하위 호환으로 남긴다. 질문 언어 쪽을 기본으로 본다.
+    r.search_query = (
+        str(raw.get("search_query") or "").strip()
+        or (r.query_ko if r.lang == "ko" else r.query_en)
+        or r.query_ko
+        or r.query_en
+        or question
+    )
     # 규칙이 잡으면 올린다. LLM 이 놓치는 쪽이 실측에서 확인됐다.
     r.date_sensitive = bool(raw.get("date_sensitive")) or rule_date_sensitive(question)
 
@@ -264,6 +377,7 @@ def build_route(raw: dict[str, Any] | None, question: str, source: str) -> Route
         r.ask_back = ""
 
     r.tools = list(DOMAIN_TOOLS[r.domain])
+    r.min_hops = DOMAIN_MIN_HOPS.get(r.domain, 0)
 
     # 날짜가 박힌 질문은 "지금도 그런가"를 묻는 것이다. 개정 이력을 볼 수 있어야
     # effective_date 와 대조해 "그때 적용된 규칙이 아니다"를 말할 수 있다.
@@ -288,8 +402,8 @@ async def classify(messages: list[dict], call_fm) -> Route:
 
     try:
         data = await call_fm(
-            [{"role": "user", "content": CLASSIFY_PROMPT.format(question=question)}],
-            384,
+            [{"role": "user", "content": CLASSIFY_PROMPT.format(question=transcript(messages))}],
+            512,
             {"response_format": ROUTE_RESPONSE_FORMAT},
         )
         content = data["choices"][0]["message"].get("content") or ""

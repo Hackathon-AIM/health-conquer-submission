@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AIM · Lunit L2 Demo</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #17202a;
+      --muted: #697386;
+      --line: #dce2ea;
+      --paper: #ffffff;
+      --wash: #f4f7fb;
+      --blue: #2563eb;
+      --blue-dark: #1746ad;
+      --patient: #e9efff;
+      --assistant: #f0f7f3;
+      --green: #15803d;
+      --red: #b42318;
+      --shadow: 0 18px 60px rgba(24, 39, 75, .12);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background:
+        radial-gradient(circle at 12% 0%, rgba(37, 99, 235, .10), transparent 32rem),
+        radial-gradient(circle at 90% 100%, rgba(21, 128, 61, .08), transparent 30rem),
+        var(--wash);
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    .shell {
+      width: min(980px, calc(100% - 28px));
+      min-height: calc(100vh - 28px);
+      margin: 14px auto;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      overflow: hidden;
+      background: rgba(255, 255, 255, .96);
+      border: 1px solid rgba(220, 226, 234, .9);
+      border-radius: 22px;
+      box-shadow: var(--shadow);
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+      padding: 20px 24px;
+      border-bottom: 1px solid var(--line);
+    }
+    .brand { display: flex; align-items: center; gap: 13px; }
+    .mark {
+      display: grid;
+      width: 42px;
+      height: 42px;
+      place-items: center;
+      color: white;
+      border-radius: 13px;
+      background: linear-gradient(145deg, var(--blue), var(--blue-dark));
+      font-weight: 800;
+      letter-spacing: -.04em;
+    }
+    h1 { margin: 0; font-size: 18px; letter-spacing: -.02em; }
+    .subtitle { margin-top: 3px; color: var(--muted); font-size: 13px; }
+    .status {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 13px;
+      white-space: nowrap;
+    }
+    .dot { width: 9px; height: 9px; border-radius: 50%; background: #98a2b3; }
+    .dot.ok { background: #22c55e; box-shadow: 0 0 0 4px rgba(34, 197, 94, .12); }
+    .dot.bad { background: #ef4444; }
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 12px 24px;
+      border-bottom: 1px solid var(--line);
+      background: #fbfcfe;
+    }
+    button {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 8px 12px;
+      background: white;
+      color: var(--ink);
+      font: inherit;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    button:hover { border-color: #a9b5c7; background: #f8fafc; }
+    button.primary {
+      min-width: 88px;
+      border-color: var(--blue);
+      background: var(--blue);
+      color: white;
+      font-weight: 700;
+    }
+    button.primary:hover { background: var(--blue-dark); }
+    button:disabled { cursor: not-allowed; opacity: .55; }
+    main {
+      min-height: 320px;
+      overflow-y: auto;
+      padding: 26px 24px 12px;
+    }
+    .welcome {
+      max-width: 620px;
+      margin: 52px auto;
+      text-align: center;
+      color: var(--muted);
+      line-height: 1.65;
+    }
+    .welcome strong { display: block; margin-bottom: 8px; color: var(--ink); font-size: 21px; }
+    .message { display: flex; margin: 0 0 18px; }
+    .message.user { justify-content: flex-end; }
+    .bubble {
+      max-width: min(760px, 88%);
+      padding: 14px 16px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      line-height: 1.6;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    .user .bubble { background: var(--patient); border-bottom-right-radius: 5px; }
+    .assistant .bubble { background: var(--assistant); border-bottom-left-radius: 5px; }
+    .meta { margin: 5px 4px 0; color: var(--muted); font-size: 11px; }
+    .assistant .meta { text-align: left; }
+    .user .meta { text-align: right; }
+    .composer {
+      padding: 16px 20px 18px;
+      border-top: 1px solid var(--line);
+      background: var(--paper);
+    }
+    .input-row { display: flex; align-items: flex-end; gap: 10px; }
+    textarea {
+      width: 100%;
+      min-height: 52px;
+      max-height: 180px;
+      resize: vertical;
+      border: 1px solid #bcc6d4;
+      border-radius: 13px;
+      padding: 13px 14px;
+      color: var(--ink);
+      background: white;
+      font: inherit;
+      line-height: 1.45;
+      outline: none;
+    }
+    textarea:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(37, 99, 235, .12); }
+    .hint { margin: 8px 2px 0; color: var(--muted); font-size: 11px; }
+    .error { color: var(--red); }
+    dialog { width: min(780px, calc(100% - 30px)); border: 0; border-radius: 16px; box-shadow: var(--shadow); }
+    dialog::backdrop { background: rgba(15, 23, 42, .45); }
+    pre { max-height: 60vh; overflow: auto; padding: 16px; border-radius: 12px; background: #101828; color: #e6edf7; white-space: pre-wrap; }
+    .dialog-head { display: flex; align-items: center; justify-content: space-between; }
+    @media (max-width: 640px) {
+      .shell { width: 100%; min-height: 100vh; margin: 0; border: 0; border-radius: 0; }
+      header, .toolbar { padding-left: 16px; padding-right: 16px; }
+      main { padding: 20px 14px 8px; }
+      .subtitle { display: none; }
+      .status span:last-child { display: none; }
+      .bubble { max-width: 94%; }
+    }
+  </style>
+</head>
+<body>
+  <section class="shell">
+    <div>
+      <header>
+        <div class="brand">
+          <div class="mark">A</div>
+          <div>
+            <h1>AIM 의료 대화 드라이버</h1>
+            <div class="subtitle">Lunit L2 · 실제 제출 API 로컬 데모</div>
+          </div>
+        </div>
+        <div class="status"><span id="dot" class="dot"></span><span id="status">확인 중</span></div>
+      </header>
+      <div class="toolbar">
+        <button id="reset">새 대화</button>
+        <button id="raw">전체 JSON</button>
+        <button id="export">JSON 저장</button>
+      </div>
+    </div>
+
+    <main id="chat" aria-live="polite">
+      <div id="welcome" class="welcome">
+        <strong>환자처럼 질문해 보세요.</strong>
+        매 턴 전체 대화가 평가 때와 같은 OpenAI-compatible API로 전달됩니다.<br>
+        약물, 가이드라인, 급여 또는 법률 질문은 MCP 근거 검색이 실행될 수 있습니다.
+      </div>
+    </main>
+
+    <form id="form" class="composer">
+      <div class="input-row">
+        <textarea id="input" placeholder="예: 세툭시맙 치료 중 변비가 심해졌는데 약 때문인가요?" required></textarea>
+        <button id="send" class="primary" type="submit">전송</button>
+      </div>
+      <div id="hint" class="hint">⌘/Ctrl + Enter로 전송 · 의료 응급상황에서는 119 또는 현지 응급번호를 이용하세요.</div>
+    </form>
+  </section>
+
+  <dialog id="dialog">
+    <div class="dialog-head"><strong>Evaluator conversation history</strong><button id="close">닫기</button></div>
+    <pre id="json"></pre>
+  </dialog>
+
+  <script>
+    const history = [];
+    const chat = document.querySelector('#chat');
+    const welcome = document.querySelector('#welcome');
+    const form = document.querySelector('#form');
+    const input = document.querySelector('#input');
+    const send = document.querySelector('#send');
+    const hint = document.querySelector('#hint');
+    const dialog = document.querySelector('#dialog');
+
+    function append(role, text, meta = '') {
+      welcome.hidden = true;
+      const row = document.createElement('div');
+      row.className = `message ${role}`;
+      const wrap = document.createElement('div');
+      const bubble = document.createElement('div');
+      bubble.className = 'bubble';
+      bubble.textContent = text;
+      wrap.appendChild(bubble);
+      if (meta) {
+        const info = document.createElement('div');
+        info.className = 'meta';
+        info.textContent = meta;
+        wrap.appendChild(info);
+      }
+      row.appendChild(wrap);
+      chat.appendChild(row);
+      chat.scrollTop = chat.scrollHeight;
+    }
+
+    async function sendMessage(text) {
+      history.push({role: 'user', content: text});
+      append('user', text, `turn ${Math.ceil(history.length / 2)}`);
+      send.disabled = true;
+      input.disabled = true;
+      hint.textContent = 'AIM이 답변을 생성하고 있습니다… 근거 검색 시 시간이 더 걸릴 수 있습니다.';
+      const started = performance.now();
+      try {
+        const response = await fetch('/v1/chat/completions', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({model: 'conquer-health-l2-native', messages: history})
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+        const data = await response.json();
+        const text = data?.choices?.[0]?.message?.content || '(빈 응답)';
+        history.push({role: 'assistant', content: text});
+        append('assistant', text, `AIM · ${((performance.now() - started) / 1000).toFixed(1)}s`);
+      } catch (error) {
+        history.pop();
+        append('assistant', `요청 실패: ${error.message}`, '브라우저 오류');
+      } finally {
+        send.disabled = false;
+        input.disabled = false;
+        input.focus();
+        hint.textContent = '⌘/Ctrl + Enter로 전송 · 의료 응급상황에서는 119 또는 현지 응급번호를 이용하세요.';
+      }
+    }
+
+    form.addEventListener('submit', event => {
+      event.preventDefault();
+      const text = input.value.trim();
+      if (!text || send.disabled) return;
+      input.value = '';
+      sendMessage(text);
+    });
+    input.addEventListener('keydown', event => {
+      if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) form.requestSubmit();
+    });
+    document.querySelector('#reset').addEventListener('click', () => {
+      history.length = 0;
+      chat.querySelectorAll('.message').forEach(node => node.remove());
+      welcome.hidden = false;
+      input.focus();
+    });
+    document.querySelector('#raw').addEventListener('click', () => {
+      document.querySelector('#json').textContent = JSON.stringify(history, null, 2);
+      dialog.showModal();
+    });
+    document.querySelector('#close').addEventListener('click', () => dialog.close());
+    document.querySelector('#export').addEventListener('click', () => {
+      const blob = new Blob([JSON.stringify(history, null, 2)], {type: 'application/json'});
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      link.download = `aim-conversation-${new Date().toISOString().replaceAll(':', '-')}.json`;
+      link.click();
+      URL.revokeObjectURL(link.href);
+    });
+
+    fetch('/health').then(response => response.json()).then(data => {
+      document.querySelector('#dot').className = `dot ${data.key_present ? 'ok' : 'bad'}`;
+      document.querySelector('#status').textContent = data.key_present ? `${data.model} 연결됨` : 'API key 없음';
+    }).catch(() => {
+      document.querySelector('#dot').className = 'dot bad';
+      document.querySelector('#status').textContent = '서버 연결 실패';
+    });
+  </script>
+</body>
+</html>
