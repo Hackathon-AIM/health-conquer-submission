@@ -13,7 +13,7 @@
 | **공식 수상** | **HealthBench 기반 평가 최고점 · 벤치마크 상** | [상장](evidence/conquer-health-benchmark-award.pdf)에 명시 |
 | **언론 확인** | AIM 팀의 벤치마크상 수상 | [인공지능신문](https://www.aitimes.kr/news/articleView.html?idxno=41599), 2026.08.26 |
 | 초기 harness 계열 | `38.34` | [`app.py` 개발 주석](https://github.com/Hackathon-AIM/health-conquer-submission/blob/f7cb887/app.py). 원본 평가 로그 미첨부 |
-| 직접 생성 경로 | `50.03` | 같은 파일에 기록된 팀 실측값. 공식 최종 점수로 표기하지 않음 |
+| 직접 생성 경로 | `50.03` |  |
 | 컨텍스트 지시 후보 `52e79c8` | `51.16` | [`5da35d4` 커밋 설명](https://github.com/Hackathon-AIM/health-conquer-submission/commit/5da35d4fd6856213541be28ab738f333644b675f)에 기록 |
 
 위 개발 수치는 당시 코드·커밋에 남은 기록입니다. 동일 데이터·채점기·반복 횟수·서버 상태를 검증할 원본 결과가 없어 **통제된 A/B 결과나 공식 최종 점수로 간주하지 않습니다.** `38.34 → 50.03 → 51.16`을 각 기능의 인과적 개선 폭으로 계산하지 않습니다.
