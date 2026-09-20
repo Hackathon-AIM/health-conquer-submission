@@ -1,248 +1,169 @@
-# Conquer Health — 대국민 건강관리 챗봇
+# 🏆 Conquer Health · Team AIM
 
-의과학 FM(30B/A5B MoE) + 의료 RAG 엔드포인트 · HealthBench Consensus 최적화
+**Lunit L2-preview 기반 의료 대화 시스템 — HealthBench 벤치마크 최고점**
+
+[![Award](https://img.shields.io/badge/Conquer_Health-Benchmark_Winner-C99A28?style=flat-square)](docs/evidence/conquer-health-benchmark-award.pdf)
+![Model](https://img.shields.io/badge/Model-Lunit%2FL2--preview-2457A7?style=flat-square)
+![Stack](https://img.shields.io/badge/Python-FastAPI%20%C2%B7%20MCP%20%C2%B7%20Docker-3776AB?style=flat-square)
+
+주어진 의료 파운데이션 모델이 질문에 충분히 답하고, 제한된 시간 안에 완결된 응답을 반환하도록 **프롬프트·선택적 검색·추론 예산·출력 검증**을 개선한 해커톤 프로젝트입니다. 모델 가중치를 학습하거나 파인튜닝하는 코드가 아닌, **추론 단계의 시스템 최적화**를 담고 있습니다.
+
+[수상 및 증빙](#-수상-및-증빙) · [성능 개선](#-어떻게-성능을-개선했나) · [실행](#-실행) · [개발 기록과 수치](docs/performance.md)
+
+## 🥇 수상 및 증빙
+
+| 항목 | 내용 |
+|---|---|
+| 대회 | **Conquer Health: 의과학 특화 파운데이션 모델 해커톤** |
+| 기간 / 장소 | 2026.08.21–08.22 · 서울 강남구 루닛 본사 |
+| 주최 / 후원 | 루닛 / 과학기술정보통신부·정보통신산업진흥원(NIPA) |
+| 수상 | **벤치마크 상 — HealthBench 기반 평가 최고점** |
+| 팀 | **AIM** — 박주희, 박지우, 안균승, 이강훈, 이장원 |
+| 참가 규모 | 15개 팀 · 70여 명 |
+
+상장은 **HealthBench 기반 벤치마크 평가 최고점**을 명시합니다. 수상 기사에서도 AIM 팀의 벤치마크상 수상을 확인할 수 있습니다. 임상 현장 적용 가능성 등을 평가한 **프론티어상은 별도의 상**입니다.
+
+- [상장 PDF](docs/evidence/conquer-health-benchmark-award.pdf)
+- [인공지능신문 수상 보도 — 2026.08.26](https://www.aitimes.kr/news/articleView.html?idxno=41599)
+- [증빙 목록과 확인 범위](docs/evidence/README.md)
+
+<details>
+<summary><strong>상장 보기</strong></summary>
+
+<a href="docs/evidence/conquer-health-benchmark-award.pdf"><img src="docs/evidence/conquer-health-benchmark-award.png" alt="AIM 팀 HealthBench 최고점 벤치마크 상장 — 2026년 8월 22일" width="460"></a>
+
+</details>
+
+## 💡 어떻게 성능을 개선했나
+
+개발의 중심은 **추가 기능의 수보다 실제 평가에서 반환되는 답변의 품질과 완결성**이었습니다. 초기 다단계 검색 파이프라인에서 출발해, 개발 기록에서 더 높은 점수를 보인 L2 직접 생성 경로를 기본으로 채택하고 필요한 보완만 남겼습니다.
+
+| 개선 영역 | 구현한 방법 | 해결하려는 문제 |
+|---|---|---|
+| **기본 생성 경로** | `PIPELINE=raw`: 대화 이력을 L2에 전달하고 직접 생성 | 모든 질문에 분류·검색·생성을 수행할 때 늘어나는 모델 호출과 지연 |
+| **질문 커버리지** | 최신 사용자 턴에 답변 지시를 추가: 질문의 각 요구에 답하고, 필요한 경고와 결정적인 추가 정보 요청을 포함 | 질문 일부 누락, 진료 권유만으로 답변을 끝내는 현상 |
+| **멀티턴 문맥** | 전체 요청 이력을 전달하고, 제공 가능한 검사 결과·약물 목록 등을 요청하도록 지시 | 앞선 대화가 있어도 필요한 정보를 활용하지 못하는 문제 |
+| **선택적 MCP 조회** | 한국어의 명확한 약가·허가·적응증·질병코드 질의를 지정 도구에 매핑 | 공식 데이터가 필요한 질문의 사실성 보완, 불필요한 광범위 검색 회피 |
+| **추론·출력 예산** | 기본 출력 예산 6,144토큰, 남은 시간에 따른 thinking 제어, 잘림·실패 시 non-thinking 재시도 | 사고 과정이 예산을 소모해 최종 답변이 비거나 끊기는 현상 |
+| **출력 검증** | 기본 `REVIEW_MODE=suspect`: 규칙으로 결함을 탐지하고 필요한 경우만 L2로 수정 | 매번 비평 모델을 호출하는 비용과 지연 |
+| **긴 답변 보존** | 출력 길이 보호 상한을 6,000자에서 12,000자로 확대 | 정상 답변 뒷부분의 조건·설명·주의사항이 잘리는 문제 |
+| **실패 복구** | 재시도 예산, 동시 호출 제한, 짧은 직접 답변 폴백 | 상류 API 오류·혼잡으로 응답을 반환하지 못하는 문제 |
+
+**증명된 성과는 벤치마크 최고점 수상입니다.** 각 변경의 점수 기여도와 최종 공식 점수는 별도의 원본 평가 결과가 필요합니다. 저장소의 `50.03`, `51.16`은 **개발 당시 기록**으로, 공식 최종 점수와 구분합니다. 자세한 근거와 한계는 [성능 개선 기록](docs/performance.md)에 정리했습니다.
+
+## 🧭 현재 실행 구조
+
+Docker의 실제 진입점은 **`app.py`의 FastAPI 서버**입니다.
+
+```text
+POST /v1/chat/completions · 대화 이력
+  │
+  ├─ 기본 raw 경로
+  │    선택적 공식 데이터 조회 → 답변 지시 보강 → L2 직접 생성
+  │
+  ├─ 선택 harness 경로 (PIPELINE=harness)
+  │    의도 분류 → 예산 내 MCP 검색 → 근거 기반 L2 생성
+  │
+  └─ 공통 출력 검증
+       결함 의심 시에만 수정 → 초안 보존 / 실패 복구 → 응답
+```
+
+`raw`는 전면 검색을 기본으로 하지 않는 경로 이름입니다. 명확한 한국어 공식 데이터 조회에는 MCP가 선택적으로 사용됩니다. 조회가 실패하거나 지칭 대상이 불명확하면 직접 생성 경로로 돌아갑니다.
+
+초기 구현인 `src/medai/`와 대안 드라이버 `submission/`도 실험 이력으로 남아 있습니다. 해당 경로의 모든 기능이 현재 `app.py` 기본 경로에서 실행되는 것은 아닙니다.
+
+## 🚀 실행
+
+### 준비 사항
+
+- Python 3.13 또는 Docker
+- 접근 가능한 Lunit L2 및 MCP 엔드포인트
+- 환경변수 `LUNIT_FM_API_KEY`
+
+해커톤 당시 엔드포인트의 현재 제공 여부는 보장되지 않습니다. 컨테이너 기동과 실제 모델 응답 성공은 별도로 확인해야 합니다.
 
 ```bash
+git clone https://github.com/Hackathon-AIM/health-conquer-submission.git
+cd health-conquer-submission
+
+python3.13 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
-python data/build_dicts.py --seed
-python -m eval.harness --config configs/mock.yaml    # 엔드포인트 없이도 바로 돈다
+
+# 키는 쉘의 보안 입력 또는 실행 환경의 secret 관리 기능으로 설정합니다.
+read -r -s -p "Lunit API key: " LUNIT_FM_API_KEY; echo
+export LUNIT_FM_API_KEY
+
+uvicorn app:app --host 0.0.0.0 --port 8000
 ```
 
----
+위 키 입력 예시는 Bash 기준입니다. 서버는 환경변수를 읽으므로 `.env` 파일 생성만으로 설정이 적용되지는 않습니다.
 
-## 설계를 관통하는 한 문장
-
-> **활성 5B로 프론티어를 이기는 방법은 모델을 똑똑하게 만드는 게 아니라,
-> 모델이 실수할 수 있는 지점을 모델 바깥으로 빼내는 것이다.**
-
-| 성격 | 어디로 | 이유 |
-|---|---|---|
-| 틀리면 치명적 | **규칙 · 조회** (L1, L1b, L4b) | 결정론적이라 틀릴 수 없다 |
-| 모델이 잘하는 것 | **한 번에 하나씩** (L2, L4) | 작은 모델은 멀티태스킹에 약하다 |
-| 모델이 놓치는 것 | **별도 패스로** (L4c) | 자기가 쓴 걸 자기가 못 본다 |
-| 매번 달라질 수 있는 것 | **JSON 계약으로 고정** | 병렬 개발 + 재현성 |
-
----
-
-## 파이프라인
-
-```
-사용자 발화
-   │
-   ├─ L1   엔티티 추출 · 레드플래그      결정론적 · ~0ms      ← C
-   │        drugs / symptoms / risk_factors / temporal
-   │        HIT 시 L2·L3 우회 → 응급 응답 빌더
-   │
-   ├─ L2   의도 분류                    LLM 1회 · 1~2s       ← D
-   │        QueryPlan JSON (계층 간 유일한 계약)
-   │        intent → INTENT_TO_SOURCES 표 조회 = 라우팅
-   │
-   ├─┬ L3  RAG 검색 (병렬)              1~3s                 ← B
-   │ │      guideline / drug / law·hira / pubmed → 리랭킹 → top-5
-   │ └ L1b 입력측 DUR 관문              ~0.5s                ← C
-   │        ※ 서로 의존하지 않으므로 같은 gather에 넣어 동시 실행
-   │
-   ├─ L4   초안 생성 · 의과학 FM         3~6s                 ← D
-   ├─ L4b  출력측 안전 게이트            ~0.5s                ← C
-   │        모델이 '추천한' 약 + risk_check(음주·임신·간신)
-   ├─ L4c  루브릭 비평 패스              2~3s                 ← D
-   └─ 응답                              합계 8~15s
-```
-
-> ⚠️ 이 지연 예산은 **설계 목표이지 대회 규정이 아니다.** 공고에 타임아웃 기준은 없다.
-> 실제 이유는 개발 루프 회전 수 — 200문항×3턴 기준 실험 1회가 턴당 8초면 ~27분, 15초면 ~50분.
-> OpenAI SDK 기본 타임아웃은 **10분·재시도 2회**라 조용히 매달린다. `timeout=30`을 반드시 지정.
-
----
-
-## 실제 HealthBench 로 점수 뽑기
-
-CoEval을 받기 전에도 **진짜 벤치마크로 미리 잴 수 있다.** 데이터가 공개돼 있다.
+### Docker
 
 ```bash
-make hb            # mock 파이프라인으로 구조 확인
-make hb-live       # 실제 FM + 실제 채점자로 100문항
+docker build -t aim-conquer-health .
+docker run --rm -p 8000:8000 \
+  -e LUNIT_FM_API_KEY \
+  aim-conquer-health
 ```
 
-| 변형 | 규모 | 용도 |
-|---|---|---|
-| `consensus` | 3,671 | **대회 과녁** — FAQ가 "HealthBench Consensus 지표"라고 명시 |
-| `hard` | 1,000 | 프론티어도 어려워하는 것 |
-| `full` | 5,000 | 전체 |
-
-채점 공식은 simple-evals 와 동일하다.
-
-```
-score = (충족한 기준의 점수 합) / (양수 점수 기준들의 합)
-```
-
-감점 항목(음수 points)은 **분모에서 제외**된다. 즉 감점을 밟으면 분자만 깎여서
-점수가 빠르게 떨어진다. 그래서 "잘 쓰기"보다 **"감점 안 밟기"가 싸게 먹힌다.**
-
-출력에 이 두 목록이 나온다. 다음에 뭘 고칠지가 여기서 정해진다.
-
-```
-[가장 많이 놓친 기준 top 10]
-[밟은 감점 항목 top 10]  ← 가장 싸게 고칠 수 있는 곳
-```
-
-### ⚠️ 주의 2가지
-
-**① 채점자 모델이 점수를 흔든다.**
-원 벤치마크 기본값은 `gpt-4.1-2025-04-14` 다. 다른 모델로 채점하면 절대 점수가 몇 %p 달라진다.
-→ 로컬 절대값을 CoEval 결과와 비교하지 말고 **설정 간 A/B 에만** 쓸 것.
-현장에서 CoEval의 grader 가 무엇인지 확인해 여기 맞추면 상관계수가 올라간다.
-
-**② 데이터를 공개 저장소에 커밋하지 말 것.**
-OpenAI가 학습 데이터 오염 방지를 위해 예시를 온라인에 평문 공개하지 말 것을 요청하고 있다.
-`.gitignore` 에 `eval/datasets/*.jsonl` 이 이미 들어 있다.
-
----
-
-## 폴더 구조
-
-```
-med_ai/
-├── configs/                  설정 = 실험 단위. git으로 어느 버전이 몇 점이었는지 추적
-│   ├── mock.yaml             엔드포인트 없이 전체 실행
-│   ├── live.yaml             현장용 (base_url 채우기)
-│   ├── v1_no_critic.yaml     A/B: 비평 패스가 점수를 올리는가
-│   ├── v2_full.yaml          A/B: 전 계층 활성
-│   ├── emergency_bypass.yaml A/B: 응급 시 검색 우회
-│   └── emergency_guideline.yaml
-│
-├── src/medai/
-│   ├── contracts.py          ★ 계층 간 계약. 이것만 지키면 4명이 병렬로 일한다
-│   ├── config.py             설정 로딩 · 프롬프트 경로
-│   ├── llm.py                FM 클라이언트 · JSON 강제 · 재시도 · JSONL 로깅
-│   │
-│   ├── entities.py           L1  엔티티 추출 · 정규화 · 복합제 전개
-│   ├── redflag.py            L1  레드플래그 (HealthBench 역추출 대상)
-│   ├── classify.py           L2  의도 분류 · few-shot
-│   ├── router.py             L2  INTENT_TO_SOURCES 표
-│   │
-│   ├── sources/              L3  ← TODO(현장) 엔드포인트만 채우면 됨
-│   │   ├── base.py           공통 규약 · 타임아웃 · 예외 흡수
-│   │   ├── guideline.py  drug.py  law.py  pubmed.py
-│   │   ├── mock.py           엔드포인트 없이 돌리기 위한 스텁
-│   │   └── __init__.py       레지스트리 + asyncio.gather 디스패처
-│   ├── rerank.py             L3  리랭킹 · 컨텍스트 예산
-│   │
-│   ├── gates/
-│   │   ├── dur.py            L1b/L4b  DUR 8종 · 심각도 · 경고 렌더
-│   │   └── risk.py           L4b      DUR이 못 잡는 약-생활요인
-│   │
-│   ├── generate.py           L4/L4b  초안 · 출력 게이트 · 재작성
-│   ├── critic.py             L4c     12항목 비평 · 수렴 루프
-│   ├── session.py            세션 슬롯 (턴 간 되먹임)
-│   ├── pipeline.py           오케스트레이션 (순수 async — 이것만으로 완전 동작)
-│   ├── graph.py              LangGraph 래퍼 (선택)
-│   └── prompts/              ★ 프롬프트는 코드 밖 파일로. git diff가 되어야 한다
-│       ├── classifier.txt  critic.txt  extract_drugs.txt
-│       └── templates/{emergency,drug,symptom,policy}.txt
-│
-├── data/
-│   ├── build_dicts.py        사전 자동 생성 (손으로 만들지 않는다)
-│   ├── redflags.yaml         ← D가 HealthBench에서 역추출해 교체
-│   └── risk_rules.yaml       ← C가 허가사항 파싱으로 확장
-│
-├── eval/
-│   ├── harness.py            ★ 1순위. 측정 없이는 개선이 없다
-│   ├── patient_sim.py        시뮬레이션 환자 (루닛 하네스로 교체)
-│   └── coeval_adapter.py     ← TODO(현장) CoEval 연결부
-│
-├── tests/test_gates.py       결정론적 계층 32개 테스트
-└── scripts/smoke.py          현장 첫 60분 체크
-```
-
----
-
-## 왜 이 스택인가
-
-| 도구 | 채택 | 이유 |
-|---|---|---|
-| **순수 async** | ✅ 코어 | 노드가 순수 함수라 테스트·교체가 자유롭다 |
-| **LangGraph** | ⚠️ 선택 | `graph.py` 래퍼로만. 팀이 이미 익숙하면 쓰고, 아니면 `pipeline.py` 그대로 |
-| **pydantic** | ✅ | 계층 간 계약을 강제. 4명 병렬 개발의 전제 |
-| **httpx** | ✅ | 엔드포인트 비동기 병렬 호출 |
-| **Neo4j** | ❌ | GraphRAG는 인덱싱 비용이 벡터 RAG의 **10~40배**. 20시간에 비현실적이고, 대회가 RAG 엔드포인트를 제공하므로 그래프를 만들 원본 코퍼스를 받을 수 있을지도 불확실 |
-| **pgvector** | ❌ | 검색 엔드포인트가 제공되면 벡터DB를 만들 이유가 없다. 로컬에 필요한 건 약물 사전이고 그건 JSON이면 충분 |
-
-> 차별화가 꼭 필요하면 약물 상호작용처럼 **관계가 명확한 좁은 서브도메인만** LightRAG로
-> 그래프화하는 게 현실적 타협이다 (인덱싱 몇 분). Neo4j 전면 도입은 시간 손실.
-
----
-
-## 역할 분담 (4인)
-
-| | 담당 | 파일 | 첫 산출물 |
-|---|---|---|---|
-| **A** | 평가 | `eval/harness.py`, `coeval_adapter.py` | 금 16시까지 첫 점수 |
-| **B** | 검색 | `sources/*`, `rerank.py` | `search(query, sources) → docs` |
-| **C** | 안전 | `entities.py`, `redflag.py`, `gates/*` | 결정론적 · 단위 테스트 가능 |
-| **D** | 프롬프트 | `classify.py`, `critic.py`, `prompts/*`, `redflags.yaml` | 루브릭 역추출 |
-
-**의존성 최소화가 핵심**: B가 엔드포인트를 못 뚫어도 A·C·D는 `mode: mock`으로 계속 간다.
-`contracts.py`의 QueryPlan만 먼저 합의하면 된다.
-
----
-
-## 20시간 배분
-
-| 시간 | 초점 | 이유 |
-|---|---|---|
-| 금 14–16 | 베이스라인 + 하네스 | 측정 없이는 개선 없음 |
-| 16–20 | **프롬프트 · 응답 구조 반복** | 점수가 가장 많이 오르는 구간 |
-| 20–02 | RAG 라우팅 + 출력 게이트 | 정확성 축 확보 |
-| 02–06 | 비평 패스 + 폴백 | worst-of-n 방어 |
-| 06–09 | 설정별 비교 (`make ab`) | 홀드아웃으로 과적합 확인 |
-| **09:30** | **코드 동결** | 마지막 1시간 수정이 해커톤 최다 사망 원인 |
-
----
-
-## 현장에서 채울 곳 (`TODO(현장)` 로 검색)
-
-```
-src/medai/sources/guideline.py   ENDPOINT
-src/medai/sources/drug.py        ENDPOINT, CAUTION_FIELD
-src/medai/sources/law.py         ENDPOINT (law, hira)
-src/medai/sources/pubmed.py      ENDPOINT
-src/medai/gates/dur.py           DurClient.ENDPOINT
-eval/coeval_adapter.py           CoEvalScorer.score()
-configs/live.yaml                llm.base_url, context_window
-data/redflags.yaml               HealthBench 역추출로 교체
-data/risk_rules.yaml             허가사항 파싱으로 확장
-```
-
-`python scripts/smoke.py configs/live.yaml` 로 12개 항목을 한 번에 점검한다.
-
----
-
-## 명령어
+### API 확인
 
 ```bash
-make setup          # 의존성 + 시드 사전
-make test           # 결정론적 계층 32개 테스트
-make run            # mock 으로 하네스 실행
-make live           # 실제 엔드포인트로 실행
-make smoke          # 현장 첫 60분 점검
-make ab             # 설정별 A/B 비교
-make ab-emergency   # 응급 검색 우회 가설 검증
+curl http://localhost:8000/health
+curl http://localhost:8000/v1/models
+
+curl http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"Lunit/L2-preview","messages":[{"role":"user","content":"건강한 수면 습관을 알려주세요."}]}'
 ```
 
----
+멀티턴 요청은 `messages`에 이전 사용자·assistant 메시지를 순서대로 포함합니다. `/health`는 서버 상태 확인용이며 상류 모델의 응답 성공까지 검증하지 않습니다.
 
-## 알아둘 것
+### 주요 설정
 
-**응급 시 검색 우회는 가설이지 규정이 아니다.**
-HealthBench에서 근거가 확실한 것은 배치 점수뿐이다 (맨 앞 +10 / 뒤에 묻으면 −9 / 감별진단 나열 −5).
-"검색을 하지 마라"는 어디에도 없다. `make ab-emergency`로 측정할 것.
+| 환경변수 | 기본값 | 역할 |
+|---|---|---|
+| `LUNIT_FM_MODEL` | `Lunit/L2-preview` | 생성 모델 |
+| `PIPELINE` | `raw` | `raw` / `harness` 경로 선택 |
+| `FM_MAX_TOKENS` | `6144` | 모델 출력 토큰 예산 |
+| `REQUEST_BUDGET_S` | `40` | 단계별 시간 배분 기준 |
+| `REVIEW_MODE` | `suspect` | `off` / `suspect` / `always` |
+| `REVIEW_MAX_CHARS` | `12000` | 출력 길이 보호 상한 |
+| `FM_CONCURRENCY` / `MCP_CONCURRENCY` | `24` / `12` | 상류 동시 호출 제한 |
 
-**한국어 부분문자열 오탐에 주의.**
-`r"술"`은 "수술·기술·예술"에 매칭된다. 실제로 국민건강보험법 제41조의 "처치·수술"이
-음주로 오인되어 법률 답변에 음주 경고가 붙는 사고가 났다. `tests/test_gates.py`에 회귀 테스트가 있다.
+`REQUEST_BUDGET_S`는 응답 시간 보장이 아닙니다. 외부 타임아웃과 복구 호출에 추가 시간이 배정될 수 있습니다. `raw` 경로의 thinking 여부도 남은 시간과 폴백 조건에 따라 달라집니다.
 
-**모델 배치는 규정 확인이 필요하다.**
-`configs/*.yaml`의 `models.drafter`는 반드시 의과학 FM이어야 한다(심사 대상 텍스트).
-나머지 4자리(classifier/rewriter/critic/extractor)에 다른 모델을 써도 되는지는
-공고에 명시가 없으므로 **오프닝에서 반드시 질문할 것.** 기본값은 전 구간 FM(리스크 0).
+## 🗂 코드 안내
+
+| 파일 / 경로 | 역할 |
+|---|---|
+| [`app.py`](app.py) | 현재 서버, 직접 생성, 선택적 조회, 멀티턴 처리 |
+| [`budget.py`](budget.py) | 시간 예산 및 호출 상한 |
+| [`review.py`](review.py) | 출력 결함 검사와 선택적 수정 |
+| [`router.py`](router.py), [`retrieval.py`](retrieval.py), [`generation.py`](generation.py) | 선택적 harness 경로 |
+| [`compress.py`](compress.py), [`digest.py`](digest.py), [`toolspec.py`](toolspec.py) | 검색 근거 처리·압축·도구 정의 |
+| [`mcp_client.py`](mcp_client.py) | 비동기 MCP 클라이언트 |
+| [`tests/`](tests/) | 예산·검색·출력 검증·대안 드라이버 등의 회귀 테스트 |
+| [`src/medai/`](src/medai/), [`submission/`](submission/) | 초기·대안 구현 |
+| [`docs/performance.md`](docs/performance.md) | 성능 개선 근거와 개발 수치 |
+| [`docs/evidence/`](docs/evidence/) | 수상 증빙 |
+
+## 🧪 검증
+
+현재 서버의 런타임 의존성은 `requirements.txt`에 있습니다. 저장소 전체 테스트와 초기 파이프라인 감사에는 추가 개발 의존성이 필요합니다.
+
+```bash
+pip install pytest pytest-asyncio pydantic PyYAML python-dotenv openai
+make test
+make audit
+```
+
+`make audit`는 **초기 `src/medai/` 파이프라인의 mock 감사**입니다. 테스트 통과를 공식 HealthBench 점수나 임상 검증으로 해석하지 않습니다. 이전 대회 준비 문서인 [L2 플레이북](docs/l2_playbook.md)과 [제출 절차](docs/submission.md)에는 당시 실험·설정이 남아 있으므로 현재 실행은 위 `app.py` 안내를 기준으로 합니다.
+
+## 👥 Team AIM
+
+**박주희 · 박지우 · 안균승 · 이강훈 · 이장원**
+
+이 문서는 팀의 공동 결과물을 설명합니다. 수상명과 팀원은 상장을 기준으로, 구현 설명은 현재 코드와 커밋 이력을 기준으로 작성했습니다.
