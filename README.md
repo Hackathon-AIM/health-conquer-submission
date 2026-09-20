@@ -72,68 +72,6 @@ POST /v1/chat/completions · 대화 이력
 
 초기 구현인 `src/medai/`와 대안 드라이버 `submission/`도 실험 이력으로 남아 있습니다. 해당 경로의 모든 기능이 현재 `app.py` 기본 경로에서 실행되는 것은 아닙니다.
 
-## 🚀 실행
-
-### 준비 사항
-
-- Python 3.13 또는 Docker
-- 접근 가능한 Lunit L2 및 MCP 엔드포인트
-- 환경변수 `LUNIT_FM_API_KEY`
-
-해커톤 당시 엔드포인트의 현재 제공 여부는 보장되지 않습니다. 컨테이너 기동과 실제 모델 응답 성공은 별도로 확인해야 합니다.
-
-```bash
-git clone https://github.com/Hackathon-AIM/health-conquer-submission.git
-cd health-conquer-submission
-
-python3.13 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-# 키는 쉘의 보안 입력 또는 실행 환경의 secret 관리 기능으로 설정합니다.
-read -r -s -p "Lunit API key: " LUNIT_FM_API_KEY; echo
-export LUNIT_FM_API_KEY
-
-uvicorn app:app --host 0.0.0.0 --port 8000
-```
-
-위 키 입력 예시는 Bash 기준입니다. 서버는 환경변수를 읽으므로 `.env` 파일 생성만으로 설정이 적용되지는 않습니다.
-
-### Docker
-
-```bash
-docker build -t aim-conquer-health .
-docker run --rm -p 8000:8000 \
-  -e LUNIT_FM_API_KEY \
-  aim-conquer-health
-```
-
-### API 확인
-
-```bash
-curl http://localhost:8000/health
-curl http://localhost:8000/v1/models
-
-curl http://localhost:8000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"Lunit/L2-preview","messages":[{"role":"user","content":"건강한 수면 습관을 알려주세요."}]}'
-```
-
-멀티턴 요청은 `messages`에 이전 사용자·assistant 메시지를 순서대로 포함합니다. `/health`는 서버 상태 확인용이며 상류 모델의 응답 성공까지 검증하지 않습니다.
-
-### 주요 설정
-
-| 환경변수 | 기본값 | 역할 |
-|---|---|---|
-| `LUNIT_FM_MODEL` | `Lunit/L2-preview` | 생성 모델 |
-| `PIPELINE` | `raw` | `raw` / `harness` 경로 선택 |
-| `FM_MAX_TOKENS` | `6144` | 모델 출력 토큰 예산 |
-| `REQUEST_BUDGET_S` | `40` | 단계별 시간 배분 기준 |
-| `REVIEW_MODE` | `suspect` | `off` / `suspect` / `always` |
-| `REVIEW_MAX_CHARS` | `12000` | 출력 길이 보호 상한 |
-| `FM_CONCURRENCY` / `MCP_CONCURRENCY` | `24` / `12` | 상류 동시 호출 제한 |
-
-`REQUEST_BUDGET_S`는 응답 시간 보장이 아닙니다. 외부 타임아웃과 복구 호출에 추가 시간이 배정될 수 있습니다. `raw` 경로의 thinking 여부도 남은 시간과 폴백 조건에 따라 달라집니다.
 
 ## 🗂 코드 안내
 
